@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { LOADING_EXCUSES, STRINGS, loadLang, saveLang } from './i18n'
 import './App.css'
 
 const API = '/api'
@@ -24,7 +25,7 @@ function Avatar({ primary, fallback, label, align }) {
   )
 }
 
-function TypingDots() {
+function TypingDots({ label }) {
   return (
     <div className="row them">
       <Avatar
@@ -33,7 +34,7 @@ function TypingDots() {
         label="Mia"
         align="left"
       />
-      <div className="bubble them typing" aria-label="Mia is typing">
+      <div className="bubble them typing" aria-label={label}>
         <span className="dot" />
         <span className="dot" />
         <span className="dot" />
@@ -43,16 +44,29 @@ function TypingDots() {
 }
 
 export default function App() {
+  const [lang, setLang] = useState(loadLang)
+  const t = STRINGS[lang] || STRINGS.zh
+  const [excuseIdx] = useState(() =>
+    Math.floor(Math.random() * LOADING_EXCUSES.zh.length),
+  )
+  const loadExcuse =
+    (LOADING_EXCUSES[lang] || LOADING_EXCUSES.zh)[excuseIdx] ||
+    t.loadingModels
+
   const [ready, setReady] = useState(false)
-  const [status, setStatus] = useState('Connecting…')
+  const [factsCount, setFactsCount] = useState(0)
+  const [statusKind, setStatusKind] = useState('loading') // ready | loading | offline
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [facts, setFacts] = useState([])
   const [ended, setEnded] = useState(false)
   const [memoryOpen, setMemoryOpen] = useState(true)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const bottomRef = useRef(null)
   const inputRef = useRef(null)
+  const settingsRef = useRef(null)
+  const everReachedApi = useRef(false)
 
   const refreshMemory = useCallback(async () => {
     try {
@@ -69,17 +83,17 @@ export default function App() {
     try {
       const res = await fetch(`${API}/health`)
       const data = await res.json()
+      everReachedApi.current = true
       setReady(!!data.ready)
-      setStatus(
-        data.ready
-          ? `在线 · ${data.facts_count ?? 0} 条记忆`
-          : '正在加载模型…',
-      )
+      setFactsCount(data.facts_count ?? 0)
+      // ready:false = models still loading — keep showing wait + excuse
+      setStatusKind(data.ready ? 'ready' : 'loading')
       if (data.ready) refreshMemory()
       if (data.ended) setEnded(true)
     } catch {
       setReady(false)
-      setStatus('API 未连接')
+      // First open / API not up yet: still show loading excuses, not "offline"
+      setStatusKind(everReachedApi.current ? 'offline' : 'loading')
     }
   }, [refreshMemory])
 
@@ -92,6 +106,20 @@ export default function App() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, busy])
+
+  useEffect(() => {
+    function onDocClick(e) {
+      if (!settingsRef.current?.contains(e.target)) setSettingsOpen(false)
+    }
+    document.addEventListener('click', onDocClick)
+    return () => document.removeEventListener('click', onDocClick)
+  }, [])
+
+  function changeLang(next) {
+    setLang(next)
+    saveLang(next)
+    setSettingsOpen(false)
+  }
 
   async function send(text) {
     const message = (text ?? input).trim()
@@ -165,22 +193,64 @@ export default function App() {
             <Avatar
               primary={MIA_AVATAR}
               fallback={MIA_AVATAR_FALLBACK}
-              label="Mia"
+              label={t.name}
               align="left"
             />
             <div>
-              <h1>米娅</h1>
-              <p className="status">{status}</p>
+              <h1>{t.name}</h1>
+              <p className="status">
+                {statusKind === 'ready' && t.online(factsCount)}
+                {statusKind === 'offline' && t.apiOffline}
+                {statusKind === 'loading' && (
+                  <>
+                    <span className="wait-hint">{t.loadingTitle}</span>
+                    <span className="excuse">
+                      {t.loadingJustThat} {loadExcuse}
+                    </span>
+                  </>
+                )}
+              </p>
             </div>
           </div>
           <div className="header-actions">
+            <div className="settings-wrap" ref={settingsRef}>
+              <button
+                type="button"
+                className="header-btn gear"
+                aria-label={t.settings}
+                aria-expanded={settingsOpen}
+                title={t.settings}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setSettingsOpen((v) => !v)
+                }}
+              >
+                ⚙️
+              </button>
+              {settingsOpen && (
+                <div className="settings-menu" role="menu">
+                  <label className="settings-row" htmlFor="lang-select">
+                    <span>{t.language}</span>
+                    <select
+                      id="lang-select"
+                      value={lang}
+                      onChange={(e) => changeLang(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <option value="zh">中文</option>
+                      <option value="en">English</option>
+                    </select>
+                  </label>
+                </div>
+              )}
+            </div>
             <button
               type="button"
               className="header-btn"
               onClick={() => setMemoryOpen((v) => !v)}
               aria-expanded={memoryOpen}
             >
-              {memoryOpen ? '收起记忆' : '长期记忆'}
+              {memoryOpen ? t.hideMemory : t.showMemory}
             </button>
             <button
               type="button"
@@ -188,7 +258,7 @@ export default function App() {
               onClick={resetSession}
               disabled={busy}
             >
-              新会话
+              {t.newSession}
             </button>
           </div>
         </header>
@@ -196,8 +266,22 @@ export default function App() {
         <div className={`layout ${memoryOpen ? '' : 'memory-collapsed'}`}>
           <main className="chat">
             <div className="thread">
-              {messages.length === 0 && !busy && (
-                <p className="empty">打个招呼吧 · 结束时说「晚安」</p>
+              {!ready && (
+                <div className="loading-card" role="status">
+                  <p className="loading-title">{t.loadingTitle}</p>
+                  <p className="just-that">
+                    {t.loadingJustThat} {loadExcuse}
+                  </p>
+                  <p className="wait-hint">{t.loadingWait}</p>
+                  <div className="loading-dots" aria-hidden="true">
+                    <span className="dot" />
+                    <span className="dot" />
+                    <span className="dot" />
+                  </div>
+                </div>
+              )}
+              {ready && messages.length === 0 && !busy && (
+                <p className="empty">{t.emptyChat}</p>
               )}
               {messages.map((msg, i) => {
                 if (msg.role === 'system') {
@@ -214,7 +298,7 @@ export default function App() {
                       <Avatar
                         primary={MIA_AVATAR}
                         fallback={MIA_AVATAR_FALLBACK}
-                        label="Mia"
+                        label={t.name}
                         align="left"
                       />
                     )}
@@ -233,14 +317,14 @@ export default function App() {
                       <Avatar
                         primary={USER_AVATAR}
                         fallback={USER_AVATAR_FALLBACK}
-                        label="You"
+                        label={t.you}
                         align="right"
                       />
                     )}
                   </div>
                 )
               })}
-              {busy && <TypingDots />}
+              {busy && <TypingDots label={t.typing} />}
               <div ref={bottomRef} />
             </div>
 
@@ -248,11 +332,11 @@ export default function App() {
               <button
                 type="button"
                 className="night-btn"
-                onClick={() => send('晚安')}
+                onClick={() => send(t.goodNightMsg)}
                 disabled={!ready || busy || ended}
-                title="晚安"
+                title={t.goodNight}
               >
-                晚安
+                {t.goodNight}
               </button>
               <input
                 ref={inputRef}
@@ -260,9 +344,7 @@ export default function App() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={onKeyDown}
-                placeholder={
-                  ended ? '会话已结束，点「新会话」' : '输入消息…'
-                }
+                placeholder={ended ? t.placeholderEnded : t.placeholder}
                 disabled={!ready || busy || ended}
               />
               <button
@@ -271,7 +353,7 @@ export default function App() {
                 onClick={() => send()}
                 disabled={!ready || busy || ended || !input.trim()}
               >
-                发送
+                {t.send}
               </button>
             </div>
           </main>
@@ -279,26 +361,26 @@ export default function App() {
           {memoryOpen && (
             <aside className="memory">
               <div className="memory-head">
-                <h2>长期记忆</h2>
+                <h2>{t.memoryTitle}</h2>
                 <div className="memory-actions">
                   <button
                     type="button"
                     className="header-btn small"
                     onClick={refreshMemory}
                   >
-                    刷新
+                    {t.refresh}
                   </button>
                   <button
                     type="button"
                     className="header-btn small"
                     onClick={() => setMemoryOpen(false)}
                   >
-                    收起
+                    {t.collapse}
                   </button>
                 </div>
               </div>
               {facts.length === 0 ? (
-                <p className="empty">暂无记忆</p>
+                <p className="empty">{t.noMemory}</p>
               ) : (
                 <ul>
                   {facts.map((f) => (
