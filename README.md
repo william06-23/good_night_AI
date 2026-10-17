@@ -49,14 +49,28 @@ Do not zip the weights into this project just to share the Python files. Copy mo
 
 ## How to run
 
-1. Edit `run_mia.bat` so the `python.exe` path is the virtual environment on **that** machine.
-2. Edit `MODEL_ID` / `EMBED_MODEL_ID` so they point at the model folders on **that** machine.
-3. Double-click `run_mia.bat`, or from this folder run:
+### CLI
+
+1. Edit `run_mia.bat` / `run_api.bat` so the `python.exe` path is the venv on **that** machine.
+2. Edit `MODEL_ID` in `mia_chat/engine.py` and `EMBED_MODEL_ID` in `mia_chat/memory.py`.
+3. Double-click `run_mia.bat`, or:
 
 ```bat
-"path\to\your\venv\Scripts\python.exe" mia_chat\chat_cli.py
+set PYTHONPATH=%CD%
+"path\to\your\venv\Scripts\python.exe" -m mia_chat.chat_cli
 ```
 
-Type a message and press Enter. Leave with `good night`, `night night`, `晚安`, or `exit`.
+Leave with `good night`, `night night`, `晚安`, or `exit`.
 
-After each reply the chat model decides whether to save a short fact (`[memory] saved: ...`). Before each reply, bge-m3 on CPU recalls relevant facts (`[memory] recalled: ...`).
+### Web UI (simple React test front-end)
+
+Double-click **`run_web.bat`**. It opens:
+1. A **Mia API** window (loads GPU models on http://127.0.0.1:8000)
+2. Vite + your browser at http://127.0.0.1:5173
+
+If the page says “API offline”, wait until the API window finishes loading.  
+`run_api.bat` alone is still available for API-only debugging.
+
+API routes: `GET /api/health`, `GET /api/memory`, `POST /api/chat`, `POST /api/session/reset`.
+
+Also: `pip install fastapi uvicorn` in the venv, and Node.js for the `web/` app (`cd web && npm install` once).

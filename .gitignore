@@ -3,3 +3,6 @@
 .venv/
 *.egg-info/
 .DS_Store
+
+# Personal chat transcript (not for GitHub)
+mia_chat/data/chat_log.jsonl

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="Mia">
+  <rect width="96" height="96" rx="48" fill="#e8b4cb"/>
+  <circle cx="48" cy="38" r="18" fill="#fff6fa"/>
+  <ellipse cx="48" cy="78" rx="28" ry="20" fill="#fff6fa"/>
+</svg>

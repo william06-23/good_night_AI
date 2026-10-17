@@ -6,9 +6,10 @@ certainty scoring, bge-m3 retrieval (CPU), and good-night organization.
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import torch
@@ -22,6 +23,18 @@ EMBED_MODEL_ID = r"C:\Users\William\William's_AI_project\bge-m3"
 EMBED_DEVICE = "cpu"
 RETRIEVE_TOP_K = 5
 RETRIEVE_MIN_SCORE = 0.25
+# How strongly time can nudge ranking (added to cosine similarity).
+TIME_BONUS_SCALE = 0.18
+# Pull a wider embedding pool, then re-rank with time.
+RETRIEVE_CANDIDATE_MULT = 3
+
+_NOW_RE = re.compile(
+    r"现在|此刻|刚才|刚刚|在干嘛|在做什么|此刻在|what\s+are\s+you\s+doing|right\s+now|\bnow\b",
+    re.I,
+)
+_TODAY_RE = re.compile(r"今天|今日|\btoday\b", re.I)
+_YESTERDAY_RE = re.compile(r"昨天|昨日|\byesterday\b", re.I)
+_WEEK_RE = re.compile(r"这周|本周|最近几天|这一周|\bthis\s+week\b|\brecent(?:ly)?\b", re.I)
 
 # Pair candidates for good-night organize (embedding similarity).
 ORGANIZE_CANDIDATE_MIN = 0.45
@@ -33,19 +46,24 @@ REWRITE_MAX_NEW_TOKENS = 192
 CERTAINTY_MAX_NEW_TOKENS = 64
 ORGANIZE_MAX_NEW_TOKENS = 96
 MAX_FACTS_PER_TURN = 5
+# Recent short-term messages (user+assistant turns) for gate/rewrite context.
+MEMORY_CONTEXT_MESSAGES = 5
 
 GATE_SYSTEM = (
-    "你是一个记忆筛选器。判断用户这句话是否包含值得长期记住的信息。"
-    "值得记住：个人事实、偏好、计划、关系、重要情绪、承诺。"
-    "不值得：寒暄、玩笑、一次性闲聊、无实质内容。"
+    "你是一个记忆筛选器。结合最近对话上下文，判断【最新用户这句话】是否包含值得长期记住的信息。"
+    "值得记住：个人事实、身份、地点、计划、关系、承诺、重要情绪；"
+    "以及各类偏好与喜好（喜欢/讨厌的食物、颜色、活动、习惯、口味等），即使说得随意也算重要。"
+    "不值得：纯寒暄、无信息的玩笑、一次性语气词、没有新信息的附和。"
+    "若最新一句本身含糊，但结合上文能确定是在陈述偏好或事实，也判 important。"
     '只输出 JSON，格式严格为：{"important": true} 或 {"important": false}'
 )
 
 REWRITE_SYSTEM = (
-    "你是一个记忆整理器。把下面对话里值得长期记住的信息改写成简短客观的陈述句。"
-    "默认只输出 1 条事实。只有用户明确说了两个互不相关的独立信息时，才拆成多条（最多5条）。"
-    "同一件事的细节、同义改写、顺带情绪不要拆成多条。"
-    "没有可记内容则输出空数组。"
+    "你是一个记忆整理器。根据最近对话上下文，把【最新一轮】里值得长期记住的信息改写成简短客观陈述句。"
+    "必须结合上文理解指代与省略（例如接上一句才知道在说什么），不要脱离语境乱写。"
+    "只提炼关于用户的稳定信息；不要把米娅的玩笑话当成用户事实。"
+    "默认只输出 1 条事实。只有最新一轮明确含两个互不相关的独立信息时，才拆成多条（最多5条）。"
+    "偏好要写成明确陈述（如「用户喜欢…」）。没有可记内容则输出空数组。"
     "用中文或英文与原文一致即可，不要撒娇口吻，不要第一人称（用名字或“用户”）。"
     '只输出 JSON，格式严格为：{"facts": ["事实1", ...]}'
 )
@@ -74,6 +92,65 @@ def _now_iso() -> str:
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, float(x)))
+
+
+def _parse_iso(ts: str | None) -> datetime | None:
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def detect_time_intent(query: str) -> str | None:
+    """Return 'now' | 'today' | 'yesterday' | 'week' | None from the user query."""
+    q = query or ""
+    if _YESTERDAY_RE.search(q):
+        return "yesterday"
+    if _TODAY_RE.search(q):
+        return "today"
+    if _NOW_RE.search(q):
+        return "now"
+    if _WEEK_RE.search(q):
+        return "week"
+    return None
+
+
+def time_relevance_bonus(
+    intent: str | None,
+    fact_dt: datetime | None,
+    now: datetime | None = None,
+    scale: float = TIME_BONUS_SCALE,
+) -> float:
+    """
+    Extra score for ranking. 0 if no temporal intent or missing timestamp.
+    Day boundaries use the machine's local timezone (e.g. 昨天 in UTC+8).
+    """
+    if not intent or fact_dt is None:
+        return 0.0
+    now = now or datetime.now().astimezone()
+    local_fact = fact_dt.astimezone(now.tzinfo)
+    fact_day = local_fact.date()
+    today = now.date()
+
+    if intent == "yesterday":
+        return scale if fact_day == today - timedelta(days=1) else 0.0
+    if intent == "today":
+        return scale if fact_day == today else 0.0
+    if intent == "week":
+        age_days = (today - fact_day).days
+        if age_days < 0 or age_days > 7:
+            return 0.0
+        return scale * (1.0 - age_days / 7.0)
+    if intent == "now":
+        # Fresher facts win; ~half-life of 12 hours.
+        age_h = max(0.0, (now - local_fact).total_seconds() / 3600.0)
+        return scale * math.exp(-age_h / 12.0)
+    return 0.0
 
 
 def _empty_store() -> dict:
@@ -127,10 +204,20 @@ def format_facts_for_prompt(facts: list[dict] | list[str], max_facts: int = 40) 
     for f in facts[-max_facts:]:
         if isinstance(f, dict):
             text = (f.get("text") or "").strip()
+            if not text:
+                continue
+            bits = []
             c = f.get("certainty")
-            if text and isinstance(c, (int, float)):
-                lines.append(f"- {text} (确信 {float(c):.2f})")
-            elif text:
+            if isinstance(c, (int, float)):
+                bits.append(f"确信 {float(c):.2f}")
+            at = _parse_iso(f.get("updated_at") or f.get("created_at") or f.get("at"))
+            if at:
+                bits.append(
+                    f"记录于 {at.astimezone().strftime('%Y-%m-%d')}"
+                )
+            if bits:
+                lines.append(f"- {text} ({', '.join(bits)})")
+            else:
                 lines.append(f"- {text}")
         else:
             text = str(f).strip()
@@ -160,13 +247,19 @@ class MemoryRetriever:
         self.model = SentenceTransformer(model_id, device=device)
         self._ids: list[str] = []
         self._texts: list[str] = []
+        self._times: list[datetime | None] = []
         self._matrix: torch.Tensor | None = None  # (N, D) on CPU, L2-normalized
+
+    @staticmethod
+    def _fact_time(entry: dict) -> datetime | None:
+        return _parse_iso(entry.get("updated_at")) or _parse_iso(entry.get("created_at"))
 
     def rebuild(self, store: dict) -> None:
         """Re-embed all facts from the memory store."""
         facts = store.get("facts") or []
         self._ids = []
         self._texts = []
+        self._times = []
         texts = []
         for f in facts:
             text = (f.get("text") or "").strip()
@@ -174,6 +267,7 @@ class MemoryRetriever:
                 continue
             self._ids.append(f.get("id") or "")
             self._texts.append(text)
+            self._times.append(self._fact_time(f))
             texts.append(text)
         if not texts:
             self._matrix = None
@@ -202,6 +296,7 @@ class MemoryRetriever:
         row = torch.from_numpy(emb)
         self._ids.append(entry.get("id") or "")
         self._texts.append(text)
+        self._times.append(self._fact_time(entry))
         if self._matrix is None:
             self._matrix = row
         else:
@@ -224,28 +319,43 @@ class MemoryRetriever:
         query: str,
         top_k: int = RETRIEVE_TOP_K,
         min_score: float = RETRIEVE_MIN_SCORE,
+        use_time: bool = True,
     ) -> list[dict]:
-        """Return top-k facts most similar to query (as {id, text, score})."""
+        """
+        Return top-k facts for query.
+        Embedding similarity first; if the query has a time cue (现在/昨天/今天/…),
+        re-rank with a light bonus for facts whose timestamps match.
+        """
         if self._matrix is None or not self._texts or not query.strip():
             return []
         q_t = self.encode_one(query)
         if q_t is None:
             return []
-        scores = (q_t @ self._matrix.T).squeeze(0)  # cosine = dot if normalized
-        k = min(top_k, scores.numel())
-        vals, idxs = torch.topk(scores, k=k)
-        out = []
-        for score, idx in zip(vals.tolist(), idxs.tolist()):
-            if score < min_score:
+        sims = (q_t @ self._matrix.T).squeeze(0)  # cosine
+        intent = detect_time_intent(query) if use_time else None
+        now = datetime.now().astimezone()
+
+        pool = min(sims.numel(), max(top_k * RETRIEVE_CANDIDATE_MULT, top_k))
+        vals, idxs = torch.topk(sims, k=pool)
+        ranked: list[dict] = []
+        for sim, idx in zip(vals.tolist(), idxs.tolist()):
+            if sim < min_score:
                 continue
-            out.append(
+            fact_dt = self._times[idx] if idx < len(self._times) else None
+            bonus = time_relevance_bonus(intent, fact_dt, now=now) if intent else 0.0
+            ranked.append(
                 {
                     "id": self._ids[idx],
                     "text": self._texts[idx],
-                    "score": float(score),
+                    "score": float(sim + bonus),
+                    "sim": float(sim),
+                    "time_bonus": float(bonus),
+                    "time_intent": intent,
+                    "updated_at": fact_dt.isoformat() if fact_dt else None,
                 }
             )
-        return out
+        ranked.sort(key=lambda h: h["score"], reverse=True)
+        return ranked[:top_k]
 
     def best_match(
         self,
@@ -253,8 +363,8 @@ class MemoryRetriever:
         min_score: float = NEAR_DUP_MIN,
         exclude_ids: set[str] | None = None,
     ) -> dict | None:
-        """Single best embedding match above min_score."""
-        hits = self.retrieve(query, top_k=5, min_score=min_score)
+        """Single best embedding match above min_score (no time re-rank)."""
+        hits = self.retrieve(query, top_k=5, min_score=min_score, use_time=False)
         exclude_ids = exclude_ids or set()
         for h in hits:
             if h["id"] not in exclude_ids:
@@ -359,11 +469,51 @@ def _generate_json(
     return _extract_json_object(reply)
 
 
-def is_important(model, tokenizer, user_text: str, assistant_text: str = "") -> bool:
-    """Gate: return True if the latest exchange looks worth long-term storage."""
-    user_blob = f"用户：{user_text}"
+def _format_recent_dialogue(
+    history: list[dict] | None,
+    user_text: str,
+    assistant_text: str = "",
+    max_messages: int = MEMORY_CONTEXT_MESSAGES,
+) -> str:
+    """
+    Build a dialogue blob: up to max_messages prior turns, then the latest exchange.
+    history is the chat_cli short-term list (may already include the latest user+assistant).
+    """
+    lines: list[str] = []
+    prior = list(history or [])
+    # Drop the latest user(+assistant) if already appended, so we don't duplicate.
+    if prior and prior[-1].get("role") == "assistant" and assistant_text:
+        if (prior[-1].get("content") or "") == assistant_text:
+            prior = prior[:-1]
+    if prior and prior[-1].get("role") == "user" and (prior[-1].get("content") or "") == user_text:
+        prior = prior[:-1]
+
+    recent = prior[-max_messages:] if max_messages > 0 else prior
+    if recent:
+        lines.append("【最近对话】")
+        for msg in recent:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            who = "用户" if role == "user" else "米娅" if role == "assistant" else role
+            lines.append(f"{who}：{content}")
+    lines.append("【最新一轮】")
+    lines.append(f"用户：{user_text}")
     if assistant_text:
-        user_blob += f"\n米娅：{assistant_text}"
+        lines.append(f"米娅：{assistant_text}")
+    return "\n".join(lines)
+
+
+def is_important(
+    model,
+    tokenizer,
+    user_text: str,
+    assistant_text: str = "",
+    history: list[dict] | None = None,
+) -> bool:
+    """Gate: return True if the latest exchange looks worth long-term storage."""
+    user_blob = _format_recent_dialogue(history, user_text, assistant_text)
     obj = _generate_json(
         model, tokenizer, GATE_SYSTEM, user_blob, GATE_MAX_NEW_TOKENS
     )
@@ -377,11 +527,15 @@ def is_important(model, tokenizer, user_text: str, assistant_text: str = "") -> 
     return False
 
 
-def summarize_facts(model, tokenizer, user_text: str, assistant_text: str = "") -> list[str]:
+def summarize_facts(
+    model,
+    tokenizer,
+    user_text: str,
+    assistant_text: str = "",
+    history: list[dict] | None = None,
+) -> list[str]:
     """Rewrite important content into one or more short factual sentences."""
-    user_blob = f"用户：{user_text}"
-    if assistant_text:
-        user_blob += f"\n米娅：{assistant_text}"
+    user_blob = _format_recent_dialogue(history, user_text, assistant_text)
     obj = _generate_json(
         model, tokenizer, REWRITE_SYSTEM, user_blob, REWRITE_MAX_NEW_TOKENS
     )
@@ -564,17 +718,23 @@ def extract_and_store(
     path: Path = MEMORY_PATH,
     retriever: MemoryRetriever | None = None,
     recalled_hits: list[dict] | None = None,
+    history: list[dict] | None = None,
 ) -> list[dict]:
     """
     Gate → rewrite into independent facts → score/store each separately.
+    Uses recent short-term history so facts stay in conversational context.
     Sibling facts from the same turn do not merge into each other.
     """
     if not user_text or not user_text.strip():
         return []
-    if not is_important(model, tokenizer, user_text, assistant_text):
+    if not is_important(
+        model, tokenizer, user_text, assistant_text, history=history
+    ):
         print("[memory] not important — skip")
         return []
-    fact_texts = summarize_facts(model, tokenizer, user_text, assistant_text)
+    fact_texts = summarize_facts(
+        model, tokenizer, user_text, assistant_text, history=history
+    )
     if not fact_texts:
         print("[memory] rewrite returned no facts — skip")
         return []

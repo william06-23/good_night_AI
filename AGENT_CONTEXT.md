@@ -98,6 +98,10 @@ When editing chat behavior, start here. When editing memory logic, edit `memory.
 
 Qwen helper calls use greedy `generate` + strict JSON prompts (`GATE_SYSTEM`, `REWRITE_SYSTEM`, `INTRO_SYSTEM`, `ORGANIZE_SYSTEM`).
 
+### `mia_chat/chat_log.py`
+
+Append-only **user transcript** (`mia_chat/data/chat_log.jsonl`). Saves raw You/Mia lines for the human to read. **Not** used for retrieval, gating, or facts. Gitignored.
+
 ### `mia_chat/data/long_term_memory.json`
 
 Persistent long-term store. Shape:
