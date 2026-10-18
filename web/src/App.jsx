@@ -43,6 +43,37 @@ function TypingDots({ label }) {
   )
 }
 
+function formatMsgTime(ts, lang) {
+  if (!ts) return ''
+  return new Date(ts).toLocaleTimeString(lang === 'zh' ? 'zh-CN' : 'en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function dayKey(ts) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
+}
+
+function formatMsgDate(ts, lang) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const that = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  const diffDays = Math.round((today - that) / 86400000)
+  if (diffDays === 0) return lang === 'zh' ? '今天' : 'Today'
+  if (diffDays === 1) return lang === 'zh' ? '昨天' : 'Yesterday'
+  return d.toLocaleDateString(lang === 'zh' ? 'zh-CN' : 'en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'short',
+  })
+}
+
 export default function App() {
   const [lang, setLang] = useState(loadLang)
   const t = STRINGS[lang] || STRINGS.zh
@@ -55,7 +86,8 @@ export default function App() {
 
   const [ready, setReady] = useState(false)
   const [factsCount, setFactsCount] = useState(0)
-  const [statusKind, setStatusKind] = useState('loading') // ready | loading | offline
+  const [statusKind, setStatusKind] = useState('offline') // offline | choose | loading | ready | error
+  const [loadError, setLoadError] = useState('')
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -67,6 +99,7 @@ export default function App() {
   const inputRef = useRef(null)
   const settingsRef = useRef(null)
   const everReachedApi = useRef(false)
+  const historyLoaded = useRef(false)
 
   const refreshMemory = useCallback(async () => {
     try {
@@ -79,27 +112,55 @@ export default function App() {
     }
   }, [])
 
+  const loadHistory = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/chat/history`)
+      if (!res.ok) return
+      const data = await res.json()
+      const rows = (data.messages || []).map((m) => ({
+        role: m.role,
+        content: m.content,
+        ts: m.ts || undefined,
+        kind: m.kind,
+      }))
+      setMessages(rows)
+      historyLoaded.current = true
+    } catch {
+      /* ignore until API is up */
+    }
+  }, [])
+
   const pollHealth = useCallback(async () => {
     try {
       const res = await fetch(`${API}/health`)
       const data = await res.json()
       everReachedApi.current = true
+      if (!historyLoaded.current) loadHistory()
       setReady(!!data.ready)
       setFactsCount(data.facts_count ?? 0)
-      // ready:false = models still loading — keep showing wait + excuse
-      setStatusKind(data.ready ? 'ready' : 'loading')
-      if (data.ready) refreshMemory()
+      setLoadError(data.load_error || '')
+      const phase = data.phase || (data.ready ? 'ready' : 'choose')
+      setStatusKind(
+        phase === 'ready' || data.ready
+          ? 'ready'
+          : phase === 'loading'
+            ? 'loading'
+            : phase === 'error'
+              ? 'error'
+              : 'choose',
+      )
+      refreshMemory()
       if (data.ended) setEnded(true)
+      else setEnded(false)
     } catch {
       setReady(false)
-      // First open / API not up yet: still show loading excuses, not "offline"
-      setStatusKind(everReachedApi.current ? 'offline' : 'loading')
+      setStatusKind('offline')
     }
-  }, [refreshMemory])
+  }, [refreshMemory, loadHistory])
 
   useEffect(() => {
     pollHealth()
-    const id = setInterval(pollHealth, 3000)
+    const id = setInterval(pollHealth, ready ? 3000 : 1000)
     return () => clearInterval(id)
   }, [pollHealth])
 
@@ -115,6 +176,36 @@ export default function App() {
     return () => document.removeEventListener('click', onDocClick)
   }, [])
 
+  async function pickModel(key) {
+    setStatusKind('loading')
+    setLoadError('')
+    try {
+      const res = await fetch(`${API}/model`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        setLoadError(data.detail || `Error ${res.status}`)
+        setStatusKind('error')
+      }
+    } catch (e) {
+      setLoadError(String(e.message || e))
+      setStatusKind('error')
+    }
+  }
+
+  async function retryPick() {
+    try {
+      await fetch(`${API}/model/retry`, { method: 'POST' })
+    } catch {
+      /* poll will recover */
+    }
+    setLoadError('')
+    setStatusKind('choose')
+  }
+
   function changeLang(next) {
     setLang(next)
     saveLang(next)
@@ -126,7 +217,8 @@ export default function App() {
     if (!message || busy || !ready || ended) return
 
     setInput('')
-    setMessages((m) => [...m, { role: 'user', content: message }])
+    const sentAt = Date.now()
+    setMessages((m) => [...m, { role: 'user', content: message, ts: sentAt }])
     setBusy(true)
 
     try {
@@ -139,7 +231,11 @@ export default function App() {
       if (!res.ok) {
         setMessages((m) => [
           ...m,
-          { role: 'system', content: data.detail || `Error ${res.status}` },
+          {
+            role: 'system',
+            content: data.detail || `Error ${res.status}`,
+            ts: Date.now(),
+          },
         ])
         return
       }
@@ -149,6 +245,7 @@ export default function App() {
           role: 'assistant',
           content: data.reply,
           recalled: data.recalled || [],
+          ts: Date.now(),
         },
       ])
       if (data.ended) setEnded(true)
@@ -156,7 +253,7 @@ export default function App() {
     } catch (e) {
       setMessages((m) => [
         ...m,
-        { role: 'system', content: String(e.message || e) },
+        { role: 'system', content: String(e.message || e), ts: Date.now() },
       ])
     } finally {
       setBusy(false)
@@ -166,11 +263,12 @@ export default function App() {
   }
 
   async function resetSession() {
+    // Clears model short-term context only; transcript stays on screen and on disk.
     setBusy(true)
     try {
       await fetch(`${API}/session/reset`, { method: 'POST' })
-      setMessages([])
       setEnded(false)
+      await loadHistory()
       await refreshMemory()
       await pollHealth()
     } finally {
@@ -201,6 +299,8 @@ export default function App() {
               <p className="status">
                 {statusKind === 'ready' && t.online(factsCount)}
                 {statusKind === 'offline' && t.apiOffline}
+                {statusKind === 'choose' && t.pickTitle}
+                {statusKind === 'error' && (loadError || t.loadFailed)}
                 {statusKind === 'loading' && (
                   <>
                     <span className="wait-hint">{t.loadingTitle}</span>
@@ -265,67 +365,171 @@ export default function App() {
 
         <div className={`layout ${memoryOpen ? '' : 'memory-collapsed'}`}>
           <main className="chat">
+            <div className="thread-wrap">
             <div className="thread">
-              {!ready && (
-                <div className="loading-card" role="status">
-                  <p className="loading-title">{t.loadingTitle}</p>
-                  <p className="just-that">
-                    {t.loadingJustThat} {loadExcuse}
-                  </p>
-                  <p className="wait-hint">{t.loadingWait}</p>
-                  <div className="loading-dots" aria-hidden="true">
-                    <span className="dot" />
-                    <span className="dot" />
-                    <span className="dot" />
-                  </div>
-                </div>
-              )}
               {ready && messages.length === 0 && !busy && (
                 <p className="empty">{t.emptyChat}</p>
               )}
               {messages.map((msg, i) => {
+                const timeLabel = formatMsgTime(msg.ts, lang)
+                const prevKey = i > 0 ? dayKey(messages[i - 1].ts) : ''
+                const thisKey = dayKey(msg.ts)
+                const showDate = Boolean(thisKey && thisKey !== prevKey)
+                const dateLabel = showDate ? formatMsgDate(msg.ts, lang) : ''
+                const dateDivider = showDate ? (
+                  <div key={`date-${thisKey}-${i}`} className="date-divider">
+                    <time dateTime={new Date(msg.ts).toISOString()}>
+                      {dateLabel}
+                    </time>
+                  </div>
+                ) : null
+
                 if (msg.role === 'system') {
+                  const isSession = msg.kind === 'session'
                   return (
-                    <div key={i} className="system-pill">
-                      {msg.content}
+                    <div key={`wrap-${i}`} className="msg-block">
+                      {dateDivider}
+                      <div
+                        className={
+                          isSession ? 'date-divider session-break' : 'system-pill'
+                        }
+                      >
+                        {isSession ? (
+                          <time
+                            dateTime={
+                              msg.ts
+                                ? new Date(msg.ts).toISOString()
+                                : undefined
+                            }
+                          >
+                            {t.sessionBreak}
+                          </time>
+                        ) : (
+                          <>
+                            <span>{msg.content}</span>
+                            {timeLabel && (
+                              <time
+                                className="msg-time"
+                                dateTime={new Date(msg.ts).toISOString()}
+                              >
+                                {timeLabel}
+                              </time>
+                            )}
+                          </>
+                        )}
+                      </div>
                     </div>
                   )
                 }
                 const mine = msg.role === 'user'
                 return (
-                  <div key={i} className={`row ${mine ? 'mine' : 'them'}`}>
-                    {!mine && (
-                      <Avatar
-                        primary={MIA_AVATAR}
-                        fallback={MIA_AVATAR_FALLBACK}
-                        label={t.name}
-                        align="left"
-                      />
-                    )}
-                    <div className={`bubble ${mine ? 'mine' : 'them'}`}>
-                      <div className="body">{msg.content}</div>
-                      {msg.recalled?.length > 0 && (
-                        <div className="recalled">
-                          {msg.recalled
-                            .map((r) => r.text)
-                            .filter(Boolean)
-                            .join(' · ')}
+                  <div key={`wrap-${i}`} className="msg-block">
+                    {dateDivider}
+                    <div className={`row ${mine ? 'mine' : 'them'}`}>
+                      {!mine && (
+                        <Avatar
+                          primary={MIA_AVATAR}
+                          fallback={MIA_AVATAR_FALLBACK}
+                          label={t.name}
+                          align="left"
+                        />
+                      )}
+                      <div className={`bubble-wrap ${mine ? 'mine' : 'them'}`}>
+                        <div className={`bubble ${mine ? 'mine' : 'them'}`}>
+                          <div className="body">{msg.content}</div>
+                          {msg.recalled?.length > 0 && (
+                            <div className="recalled">
+                              {msg.recalled
+                                .map((r) => r.text)
+                                .filter(Boolean)
+                                .join(' · ')}
+                            </div>
+                          )}
                         </div>
+                        {timeLabel && (
+                          <time
+                            className="msg-time"
+                            dateTime={new Date(msg.ts).toISOString()}
+                          >
+                            {timeLabel}
+                          </time>
+                        )}
+                      </div>
+                      {mine && (
+                        <Avatar
+                          primary={USER_AVATAR}
+                          fallback={USER_AVATAR_FALLBACK}
+                          label={t.you}
+                          align="right"
+                        />
                       )}
                     </div>
-                    {mine && (
-                      <Avatar
-                        primary={USER_AVATAR}
-                        fallback={USER_AVATAR_FALLBACK}
-                        label={t.you}
-                        align="right"
-                      />
-                    )}
                   </div>
                 )
               })}
               {busy && <TypingDots label={t.typing} />}
               <div ref={bottomRef} />
+            </div>
+            {(statusKind === 'choose' ||
+              statusKind === 'offline' ||
+              statusKind === 'error' ||
+              statusKind === 'loading') && (
+              <div className="chat-overlay">
+                {(statusKind === 'choose' || statusKind === 'offline') && (
+                  <div className="pick-card">
+                    <p className="loading-title">{t.pickTitle}</p>
+                    <p className="wait-hint">
+                      {statusKind === 'offline' ? t.apiStarting : t.pickHint}
+                    </p>
+                    <button
+                      type="button"
+                      className="model-btn"
+                      disabled={statusKind === 'offline'}
+                      onClick={() => pickModel('7b')}
+                    >
+                      <strong>{t.pick7}</strong>
+                      <span>{t.pick7note}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="model-btn"
+                      disabled={statusKind === 'offline'}
+                      onClick={() => pickModel('14b')}
+                    >
+                      <strong>{t.pick14}</strong>
+                      <span>{t.pick14note}</span>
+                    </button>
+                  </div>
+                )}
+                {statusKind === 'error' && (
+                  <div className="pick-card">
+                    <p className="loading-title">{t.loadFailed}</p>
+                    <p className="excuse">{loadError}</p>
+                    <button
+                      type="button"
+                      className="model-btn"
+                      onClick={retryPick}
+                    >
+                      <strong>{t.pickRetry}</strong>
+                    </button>
+                  </div>
+                )}
+                {statusKind === 'loading' && (
+                  <div className="loading-card" role="status">
+                    <p className="loading-title">{t.loadingTitle}</p>
+                    <p className="just-that">
+                      {t.loadingJustThat} {loadExcuse}
+                    </p>
+                    <p className="wait-hint">{t.loadingWait}</p>
+                    <div className="loading-dots" aria-hidden="true">
+                      <span className="dot" />
+                      <span className="dot" />
+                      <span className="dot" />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
             </div>
 
             <div className="composer">
@@ -382,16 +586,25 @@ export default function App() {
               {facts.length === 0 ? (
                 <p className="empty">{t.noMemory}</p>
               ) : (
-                <ul>
-                  {facts.map((f) => (
-                    <li key={f.id}>
-                      <span>{f.text}</span>
-                      {typeof f.certainty === 'number' && (
-                        <em>{f.certainty.toFixed(2)}</em>
-                      )}
-                    </li>
-                  ))}
-                </ul>
+                <>
+                  <p className="memory-legend">
+                    <span className="swatch new" /> {t.memoryNew}
+                    <span className="swatch old" /> {t.memoryOld}
+                  </p>
+                  <ul>
+                    {facts.map((f) => (
+                      <li
+                        key={f.id}
+                        className={f.session_new ? 'fact-new' : 'fact-old'}
+                      >
+                        <span>{f.text}</span>
+                        {typeof f.certainty === 'number' && (
+                          <em>{f.certainty.toFixed(2)}</em>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </>
               )}
             </aside>
           )}

@@ -16,15 +16,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from .chat_log import load_messages
 from .engine import MiaEngine
+from .memory import load_memory
 
 engine = MiaEngine()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Starting Mia API — loading models (this can take a minute)…")
-    engine.load()
+    print("Mia API up. Waiting for a model choice (7b or 14b) from the UI.")
     yield
     print("Mia API shutting down.")
 
@@ -48,6 +49,10 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
 
 
+class ModelChoice(BaseModel):
+    key: str = Field(..., min_length=1)
+
+
 class ChatResponse(BaseModel):
     reply: str
     recalled: list[dict[str, Any]]
@@ -61,11 +66,36 @@ def health() -> dict[str, Any]:
     return engine.status()
 
 
+@app.post("/api/model")
+def choose_model(body: ModelChoice) -> dict[str, Any]:
+    try:
+        engine.begin_load(body.key)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return engine.status()
+
+
+@app.post("/api/model/retry")
+def retry_model() -> dict[str, Any]:
+    engine.clear_error()
+    return engine.status()
+
+
 @app.get("/api/memory")
 def get_memory() -> dict[str, Any]:
-    if not engine.ready:
-        raise HTTPException(503, "Engine not ready")
-    return engine.get_memory()
+    # Full long-term store (old + new). Available before a chat model is loaded.
+    store = engine.get_memory()
+    if store.get("facts"):
+        return store
+    return load_memory()
+
+
+@app.get("/api/chat/history")
+def chat_history() -> dict[str, Any]:
+    """Past transcript for the UI only — not fed back into the model."""
+    return {"messages": load_messages()}
 
 
 @app.post("/api/chat", response_model=ChatResponse)

@@ -57,3 +57,64 @@ def log_turn(
     """Save one user + Mia exchange as-is."""
     append_log_event("user", user_text, session_id, path=path)
     append_log_event("assistant", assistant_text, session_id, path=path)
+
+
+def _ts_to_ms(ts_iso: str | None) -> int | None:
+    if not ts_iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def load_messages(
+    path: Path = CHAT_LOG_PATH,
+    max_events: int = 2000,
+) -> list[dict]:
+    """
+    Read the human transcript for the UI.
+
+    Returns user/assistant rows plus session break markers.
+    Not used for model context or recall.
+    """
+    if not path.is_file():
+        return []
+    rows: list[dict] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            role = row.get("role")
+            if role not in ("user", "assistant", "session"):
+                continue
+            ts_ms = _ts_to_ms(row.get("ts"))
+            if role == "session":
+                rows.append(
+                    {
+                        "role": "system",
+                        "kind": "session",
+                        "content": row.get("content") or "start",
+                        "ts": ts_ms,
+                    }
+                )
+            else:
+                content = (row.get("content") or "").strip()
+                if not content:
+                    continue
+                rows.append(
+                    {
+                        "role": role,
+                        "content": content,
+                        "ts": ts_ms,
+                    }
+                )
+    if max_events > 0 and len(rows) > max_events:
+        rows = rows[-max_events:]
+    return rows

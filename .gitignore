@@ -4,5 +4,6 @@
 *.egg-info/
 .DS_Store
 
-# Personal chat transcript (not for GitHub)
+# Personal runtime data (created empty on first run)
 mia_chat/data/chat_log.jsonl
+mia_chat/data/long_term_memory.json

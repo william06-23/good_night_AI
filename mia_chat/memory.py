@@ -79,10 +79,24 @@ INTRO_SYSTEM = (
 ORGANIZE_SYSTEM = (
     "你是记忆冲突仲裁器。比较两条关于用户的事实，判断关系。"
     'relation 只能是 "same"、"contradict"、"unrelated" 之一。'
-    "same：意思基本相同（改写/同义/同一事实）。"
-    "contradict：两条不能同时为真（例如互斥身份、互斥日期）。"
-    "unrelated：可以同时为真（例如喜欢蓝色和喜欢黄色；不同方面的偏好）。"
+    "same：几乎同一条事实的同义改写（只是换了说法，信息点完全一样）。"
+    "contradict：两条不能同时为真（例如互斥的唯一身份、互斥的唯一日期）。"
+    "unrelated：可以同时为真。"
+    "重要：多种称呼/昵称偏好可以并存（如既可叫宝宝也可叫老公）→ unrelated，不是 same，也不是 contradict。"
+    "重要：多种喜好可以并存（如喜欢蓝色和喜欢黄色）→ unrelated。"
+    "不要因为同属「称呼」或「喜好」类就判成 same/contradict。"
     '只输出 JSON：{"relation": "same"|"contradict"|"unrelated"}'
+)
+
+# Compatible preference families: if both facts match, never drop one for same/contradict.
+_CALL_PREF_RE = re.compile(
+    r"称呼|叫作|叫我|叫他|叫她|昵称|宝宝|老公|老婆|亲爱的|"
+    r"call(?:ed|ing)?\s+me|nickname|prefer(?:s|red)?\s+to\s+be\s+called",
+    re.I,
+)
+_LIKE_PREF_RE = re.compile(
+    r"喜欢|不喜欢|爱吃|讨厌|偏好|喜好|\blikes?\b|\bdislikes?\b|\bprefer(?:s|ence)?\b",
+    re.I,
 )
 
 
@@ -448,6 +462,16 @@ def _generate_json(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    # llama-cpp (GGUF) backend
+    if hasattr(model, "create_chat_completion"):
+        out = model.create_chat_completion(
+            messages=messages,
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+        )
+        reply = (out["choices"][0]["message"].get("content") or "").strip()
+        return _extract_json_object(reply)
+
     prompt_text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -763,16 +787,36 @@ def extract_and_store(
     return results
 
 
+def _compatible_preference_pair(text_a: str, text_b: str) -> bool:
+    """True when both facts are call-names or likes that can coexist."""
+    a = text_a or ""
+    b = text_b or ""
+    if _CALL_PREF_RE.search(a) and _CALL_PREF_RE.search(b):
+        return True
+    if _LIKE_PREF_RE.search(a) and _LIKE_PREF_RE.search(b):
+        return True
+    return False
+
+
 def classify_relation(model, tokenizer, text_a: str, text_b: str) -> str:
     """Return 'same' | 'contradict' | 'unrelated'."""
+    # Exact same string only — different nicknames/likes must stay separate.
+    if _normalize(text_a) and _normalize(text_a) == _normalize(text_b):
+        return "same"
+    if _compatible_preference_pair(text_a, text_b):
+        return "unrelated"
+
     blob = f"事实A：{text_a}\n事实B：{text_b}"
     obj = _generate_json(model, tokenizer, ORGANIZE_SYSTEM, blob, ORGANIZE_MAX_NEW_TOKENS)
     if not obj:
         return "unrelated"
     rel = str(obj.get("relation", "unrelated")).strip().lower()
-    if rel in {"same", "contradict", "unrelated"}:
-        return rel
-    return "unrelated"
+    if rel not in {"same", "contradict", "unrelated"}:
+        return "unrelated"
+    # Safety net: model still mis-labels coexisting prefs as same/contradict.
+    if rel in {"same", "contradict"} and _compatible_preference_pair(text_a, text_b):
+        return "unrelated"
+    return rel
 
 
 def organize_memory(

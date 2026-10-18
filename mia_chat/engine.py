@@ -2,11 +2,14 @@
 Shared Mia chat engine for CLI and FastAPI.
 
 Loads Qwen (GPU) + bge-m3 (CPU) once; keeps short-term history in RAM.
+7B uses transformers + bitsandbytes. 14B uses llama-cpp GGUF (GPU + RAM).
 """
 
 from __future__ import annotations
 
+import os
 import threading
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -21,7 +24,29 @@ from .memory import (
     organize_memory,
 )
 
-MODEL_ID = r"C:\Users\William\William's_AI_project\Qwen2.5-7B-Instruct-bnb-4bit"
+# CUDA 12 runtime DLLs required by the llama-cpp-python Windows CUDA wheel.
+LLAMA_CUDART_DIR = Path(r"C:\Users\William\William's_AI_project\llama_cpp_cudart12")
+
+CHAT_MODELS = {
+    "7b": {
+        "label": "Qwen 2.5 7B",
+        "note": "Fits this laptop easily",
+        "backend": "transformers",
+        "path": r"C:\Users\William\William's_AI_project\Qwen2.5-7B-Instruct-bnb-4bit",
+    },
+    "14b": {
+        "label": "Qwen 2.5 14B",
+        "note": "GGUF; most layers on GPU, rest in RAM",
+        "backend": "gguf",
+        "path": (
+            r"C:\Users\William\William's_AI_project"
+            r"\Qwen2.5-14B-Instruct-GGUF\Qwen2.5-14B-Instruct-Q4_K_M.gguf"
+        ),
+        # Leave VRAM headroom for KV cache; full 48-layer offload thrashes 8 GB cards.
+        "n_gpu_layers": 32,
+        "n_ctx": 4096,
+    },
+}
 MAX_PROMPT_TOKENS = 2040
 MAX_NEW_TOKENS = 256
 EXIT_PHRASES = {"good night", "night night", "晚安", "exit"}
@@ -42,31 +67,106 @@ MIA_SYSTEM_PROMPT = (
 )
 
 
+def _prepare_llama_cpp_dlls() -> None:
+    """Put CUDA 12 runtime next to llama.dll so Windows can load the wheel."""
+    if not LLAMA_CUDART_DIR.is_dir():
+        raise FileNotFoundError(
+            f"Missing llama-cpp CUDA runtime folder: {LLAMA_CUDART_DIR}"
+        )
+    cudart = str(LLAMA_CUDART_DIR)
+    os.environ["PATH"] = cudart + os.pathsep + os.environ.get("PATH", "")
+    try:
+        os.add_dll_directory(cudart)
+    except (OSError, AttributeError):
+        pass
+
+
 class MiaEngine:
     """One loaded model pair + one active chat session."""
 
     def __init__(self) -> None:
         self.model = None
         self.tokenizer = None
+        self.backend: str | None = None
         self.retriever: MemoryRetriever | None = None
-        self.memory_store: dict = {"facts": []}
+        # Load long-term facts immediately so the UI can show them before model pick.
+        self.memory_store: dict = load_memory()
         self.history: list[dict] = []
         self.session_id: str = ""
         self.ready = False
         self.ended = False
+        self.phase = "choose"  # choose | loading | ready | error
+        self.model_key: str | None = None
+        self.load_error: str | None = None
         self._lock = threading.Lock()
 
-    def load(self) -> None:
-        print("Loading embedder (CPU)…")
-        self.retriever = MemoryRetriever()
-        self.memory_store = load_memory()
-        self.retriever.rebuild(self.memory_store)
+    def list_models(self) -> list[dict]:
+        return [
+            {"key": key, "label": meta["label"], "note": meta["note"]}
+            for key, meta in CHAT_MODELS.items()
+        ]
 
-        print(f"Loading chat model: {MODEL_ID} (GPU/auto)")
-        print(f"CUDA available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            print(f"GPU: {torch.cuda.get_device_name(0)}")
+    def begin_load(self, model_key: str) -> None:
+        """Start loading in the background. UI polls status until ready."""
+        if model_key not in CHAT_MODELS:
+            raise ValueError(f"Unknown model: {model_key}")
+        with self._lock:
+            if self.phase == "loading":
+                raise RuntimeError("A model is already loading")
+            if self.phase == "ready":
+                raise RuntimeError("A model is already loaded — restart the API to switch")
+            self.phase = "loading"
+            self.model_key = model_key
+            self.load_error = None
+            self.ready = False
+        threading.Thread(
+            target=self._load_worker, args=(model_key,), daemon=True
+        ).start()
 
+    def load(self, model_key: str = "7b") -> None:
+        """Blocking load (CLI)."""
+        self.phase = "loading"
+        self.model_key = model_key
+        self._load_worker(model_key)
+        if self.phase == "error":
+            raise RuntimeError(self.load_error or "Model failed to load")
+
+    def _load_worker(self, model_key: str) -> None:
+        meta = CHAT_MODELS[model_key]
+        model_id = meta["path"]
+        backend = meta.get("backend", "transformers")
+        try:
+            if self.retriever is None:
+                print("Loading embedder (CPU)…")
+                self.retriever = MemoryRetriever()
+                self.memory_store = load_memory()
+                self.retriever.rebuild(self.memory_store)
+
+            print(f"Loading chat model: {model_id} ({backend})")
+            print(f"CUDA available: {torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+            if backend == "gguf":
+                self._load_gguf(meta)
+            else:
+                self._load_transformers(model_id)
+
+            self.backend = backend
+            # Fresh short-term context; do not write a transcript break (user will still
+            # see prior messages from chat_log). Explicit UI reset logs a break.
+            self.reset_session(log_break=False)
+            self.ready = True
+            self.phase = "ready"
+            n = len(self.memory_store.get("facts") or [])
+            print(f"Engine ready ({model_key}/{backend}). Long-term facts: {n}")
+        except Exception as e:
+            self.ready = False
+            self.phase = "error"
+            self.load_error = str(e)
+            print(f"[engine] failed to load {model_key}: {e}")
+
+    def _load_transformers(self, model_id: str) -> None:
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -74,10 +174,10 @@ class MiaEngine:
             bnb_4bit_use_double_quant=True,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_ID, trust_remote_code=True
+            model_id, trust_remote_code=True
         )
         self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
+            model_id,
             quantization_config=quant_config,
             device_map="auto",
             trust_remote_code=True,
@@ -86,20 +186,53 @@ class MiaEngine:
         if getattr(self.model, "generation_config", None) is not None:
             self.model.generation_config.max_length = None
 
-        self.reset_session()
-        self.ready = True
-        n = len(self.memory_store.get("facts") or [])
-        print(f"Engine ready. Long-term facts: {n}")
+    def _load_gguf(self, meta: dict) -> None:
+        model_path = meta["path"]
+        if not Path(model_path).is_file():
+            raise FileNotFoundError(f"GGUF not found: {model_path}")
+        _prepare_llama_cpp_dlls()
+        from llama_cpp import Llama
 
-    def reset_session(self) -> None:
+        n_gpu_layers = int(meta.get("n_gpu_layers", 32))
+        n_ctx = int(meta.get("n_ctx", 4096))
+        print(
+            f"14B GGUF: n_gpu_layers={n_gpu_layers}, n_ctx={n_ctx} "
+            "(remaining layers stay in system RAM)"
+        )
+        self.tokenizer = None
+        self.model = Llama(
+            model_path=model_path,
+            n_gpu_layers=n_gpu_layers,
+            n_ctx=n_ctx,
+            verbose=False,
+        )
+
+    def clear_error(self) -> None:
+        """After a failed load, let the user pick again."""
+        with self._lock:
+            if self.phase == "error":
+                self.phase = "choose"
+                self.model_key = None
+                self.load_error = None
+
+    def reset_session(self, *, log_break: bool = True) -> None:
+        """
+        Clear short-term model context only (like leaving and coming back).
+        Long-term memory and the on-disk chat transcript stay untouched.
+        """
         self.history = []
         self.ended = False
         self.session_id = new_session_id()
-        start_session(self.session_id)
+        if log_break:
+            start_session(self.session_id)
 
     def status(self) -> dict[str, Any]:
         return {
             "ready": self.ready,
+            "phase": self.phase,
+            "model_key": self.model_key,
+            "load_error": self.load_error,
+            "models": self.list_models(),
             "ended": self.ended,
             "session_id": self.session_id,
             "facts_count": len(self.memory_store.get("facts") or []),
@@ -110,6 +243,11 @@ class MiaEngine:
         return self.memory_store
 
     def _count_tokens(self, messages: list) -> int:
+        if self.backend == "gguf":
+            blob = "\n".join(
+                f"{m.get('role', '')}: {m.get('content', '')}" for m in messages
+            )
+            return len(self.model.tokenize(blob.encode("utf-8"), add_bos=False))
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -136,6 +274,16 @@ class MiaEngine:
     def _generate(self, system_msg: dict, history: list) -> str:
         history = self._trim_history(system_msg, history)
         messages = [system_msg] + history
+        if self.backend == "gguf":
+            out = self.model.create_chat_completion(
+                messages=messages,
+                max_tokens=MAX_NEW_TOKENS,
+                temperature=0.7,
+                top_p=0.9,
+                repeat_penalty=1.1,
+            )
+            return (out["choices"][0]["message"].get("content") or "").strip()
+
         prompt_text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -180,25 +328,32 @@ class MiaEngine:
 
             ended = user_text.lower() in EXIT_PHRASES
             if ended:
-                organize_memory(
-                    self.model,
-                    self.tokenizer,
-                    self.memory_store,
-                    retriever=self.retriever,
-                )
-                self.retriever.rebuild(self.memory_store)
+                try:
+                    organize_memory(
+                        self.model,
+                        self.tokenizer,
+                        self.memory_store,
+                        retriever=self.retriever,
+                    )
+                    self.retriever.rebuild(self.memory_store)
+                except Exception as e:
+                    # Never fail the goodbye reply because organize crashed.
+                    print(f"[engine] organize_memory failed (kept reply): {e}")
                 self.ended = True
             else:
-                extract_and_store(
-                    self.model,
-                    self.tokenizer,
-                    self.memory_store,
-                    user_text,
-                    reply,
-                    retriever=self.retriever,
-                    recalled_hits=hits,
-                    history=self.history,
-                )
+                try:
+                    extract_and_store(
+                        self.model,
+                        self.tokenizer,
+                        self.memory_store,
+                        user_text,
+                        reply,
+                        retriever=self.retriever,
+                        recalled_hits=hits,
+                        history=self.history,
+                    )
+                except Exception as e:
+                    print(f"[engine] extract_and_store failed (kept reply): {e}")
 
             return {
                 "reply": reply,

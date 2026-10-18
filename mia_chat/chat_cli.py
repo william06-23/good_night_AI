@@ -7,7 +7,10 @@ from .engine import EXIT_PHRASES, MiaEngine
 
 def main():
     engine = MiaEngine()
-    engine.load()
+    print("Choose chat model: 1 = 7B (safer)   2 = 14B (smarter, tighter VRAM)")
+    choice = input("Model [1]: ").strip() or "1"
+    model_key = "14b" if choice == "2" else "7b"
+    engine.load(model_key)
     print("Type a message and press Enter. Say good night / 晚安 / exit to leave.")
     print(f"Chat log session: {engine.session_id[:8]}…")
 
