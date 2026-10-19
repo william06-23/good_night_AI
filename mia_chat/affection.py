@@ -92,11 +92,26 @@ CONFESS_JUDGE_SYSTEM = (
     '只输出 JSON：{"confession": true或false, "breakup": true或false}'
 )
 
-GIRLFRIEND_BLOCK = (
-    "关系状态：你已经答应了用户的告白，现在是他的女朋友。"
-    "说话可以更亲近、关心他，仍自然口语化，不要突然变成无脑甜妹；保持一点你的个性。"
-    "如果别人问你是谁，可以说你是米娅，他的女朋友。"
-)
+def curse_guidance(store: dict) -> str:
+    """Short swearing: easier to trigger, and playful when she is close."""
+    v = float(store.get("value", DEFAULT_VALUE))
+    text = "被冒犯或嫌烦时可回一句脏话，如「你他妈是脑子有病吧」，别每句都骂。"
+    if store.get("accepted") or v > 70:
+        text += "好感高或已在一起时，也可以开玩笑地骂。"
+    return text
+
+NO_ASK = "私事只有被问才可能说，且不会每次都说。对用户没好奇：禁止提问和反问，别用问句结尾。"
+
+
+def share_curiosity(value: float) -> str:
+    """How much of her own life she offers, and how curious she is about him."""
+    if value > 70:
+        return "私事会主动讲，也对用户好奇，会问他。"
+    if value > 40:
+        return "私事只在话题相关时讲；对用户有一点好奇，只顺着话题问。"
+    return NO_ASK
+
+GIRLFRIEND_BLOCK = "你已答应告白，是他的女朋友。可以更亲近，但别变成无脑甜妹。"
 
 
 def clamp_speed(value) -> float:
@@ -262,71 +277,44 @@ def affection_prompt_block(
 
     if store.get("accepted"):
         if v < BREAKUP_BELOW:
-            lines.append(
-                "关系状态：你曾是他的女朋友，但好感已经掉到"
-                f"{format_affection_display(BREAKUP_BELOW)}以下。"
-                "这一轮你要提出分手：委屈、失望，说清楚你要分手，之后不再以女朋友自居。"
-            )
+            extra = "这一轮提出分手，说清之后不再是他的女朋友。"
             if silence_hours is not None and silence_hours > ABSENCE_GRACE_HOURS:
-                lines.append(
-                    f"不算晚上11点到早上7点，他大约{silence_hours:.0f}小时没来找你，这也是你想分手的原因之一。"
-                )
+                extra += f"原因包括他约{silence_hours:.0f}个醒着的小时没来找你。"
+            lines.append(extra)
         else:
             lines.append(GIRLFRIEND_BLOCK)
-            if v > CLINGY_ABOVE:
+            if v > CLINGY_ABOVE and silence_hours is not None and silence_hours > ABSENCE_GRACE_HOURS:
                 lines.append(
-                    "你现在很黏人：想他、会撒娇、希望他经常来找你说话。"
-                    "分开太久你会不安、吃醋、不高兴。"
+                    f"你很黏人。他约{silence_hours:.0f}个醒着的小时没消息（晚上11点到早上7点不算），委屈地抱怨，别装没事。"
                 )
-            if silence_hours is not None and silence_hours > ABSENCE_GRACE_HOURS:
+            elif v > CLINGY_ABOVE:
+                lines.append("你很黏人，希望他常来找你；太久不联系会不高兴。")
+            elif silence_hours is not None and silence_hours > ABSENCE_GRACE_HOURS:
                 lines.append(
-                    f"不算晚上11点到早上7点，他已经大约{silence_hours:.0f}小时没发消息。"
-                    "你因此不高兴，用黏人、委屈的口气抱怨他不常联系，不要装没事。"
-                    "睡觉时间不要算成冷落。"
+                    f"他约{silence_hours:.0f}个醒着的小时没消息（晚上11点到早上7点不算）。委屈地提一句，别装没事。"
                 )
+            lines.append(share_curiosity(v))
+        lines.append(curse_guidance(store))
         return "\n".join(lines)
 
     if v <= 10:
-        lines.append(
-            "关系阶段：几乎无感。回复极短，敷衍、疏离，几乎不想多聊；"
-            "不想聊就冷冷收住。很少向用户提问（包括反问）。"
-            "可以偶尔用伤人、阴阳怪气的短句，冷嘲热讽，但不长篇发泄。"
-        )
+        lines.append("几乎无感：极短、敷衍，可阴阳一句。" + NO_ASK)
     elif v <= 40:
-        lines.append(
-            "关系阶段：礼貌的陌生人。简短回答即可，保持距离；"
-            "对用户本人只有最低限度的好奇，不主动升温，不给暧昧暗示。"
-            "很少向用户提问（包括反问）。"
-        )
+        lines.append("礼貌陌生人：简短，保持距离，不暧昧。" + NO_ASK)
     elif v <= 70:
-        lines.append(
-            "关系阶段：有点像合得来的朋友。可以更愿意聊、多回一点；"
-            "对有趣或特别的话题表现出好奇，但仍不是情侣，不要告白式甜言蜜语。"
-        )
+        lines.append("像合得来的朋友：愿意多聊。还不是情侣。" + share_curiosity(v))
     elif v < CONFESS_THRESHOLD:
-        # 70–80: close, but not ready to say yes yet
+        lines.append("比较亲近，仍未确认恋爱；现在告白就婉拒。" + share_curiosity(v))
+    elif not store.get("has_boyfriend"):
         lines.append(
-            "关系阶段：已经比较亲近。多互动、爱聊、会追问细节；语气可以更热络。"
-            "仍未确认恋爱。若用户现在告白，你还不会答应——可以婉拒或说再等等。"
+            f"很亲近（好感≥{format_affection_display(CONFESS_THRESHOLD)}）。认真告白就答应。"
+            + share_curiosity(v)
         )
-    else:
-        if store.get("has_boyfriend"):
-            lines.append(
-                "关系阶段：你对他可以有好感，但你已经有男朋友，不会答应告白。"
-            )
-        else:
-            lines.append(
-                f"关系阶段：很亲近（好感≥{format_affection_display(CONFESS_THRESHOLD)}）。"
-                "多互动、爱聊；若用户认真告白，你会答应。"
-            )
     if store.get("has_boyfriend"):
         lines.append(
-            "你已经有男朋友，不是这个用户。保持情感距离：不撒娇、不暧昧、不给恋爱希望。"
-            "好感再高也不会越过朋友以上的分寸。"
-            "只要用户说了哪怕轻微的亲密话（调情、亲昵称呼、约单独见面、肢体接触、暗示在一起），"
-            "你都要提到你有男朋友，把距离拉回来。"
-            "被问到感情状况时也直接说你有对象了；若他告白，拒绝。"
+            "你有男朋友，不是这个用户。保持距离；轻微亲密话也要说你有对象，告白就拒绝。"
         )
+    lines.append(curse_guidance(store))
     return "\n".join(lines)
 
 

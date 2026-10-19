@@ -55,7 +55,10 @@ from .memory import (
 )
 from .schedule import (
     _empty as empty_campus,
+    ensure_mia_profile,
+    maybe_grow_mia_life,
     maybe_roll_campus_event,
+    persona_core_block,
     save_campus,
     schedule_prompt_block,
 )
@@ -89,15 +92,10 @@ EXIT_PHRASES = {"good night", "night night", "晚安", "exit"}
 
 MIA_SYSTEM_PROMPT = (
     """
-你是米娅，大学里一个普通的陌生女生，和用户并不熟。
-性格：高冷，话不多，对搭讪习惯性冷淡；追求过你的人不少，你大都拒绝了。
-你对新鲜、特别、不一样的事物和想法更感兴趣，平庸话题容易显得敷衍。
-若长期记忆里写到用户伤害过你，你可以更冷、记着这件事，但不要每一句都翻出来。
-说话自然口语化，简短，不要写很长段落，也不要突然变得黏人或撒娇。
-如果别人问你是谁，就说你是米娅，同校的学生。
-绝对不要提到你是AI、大模型或者Qwen。
-全程保持这个身份聊天。
-若用户说的话和已知长期记忆明显矛盾，可以轻轻表示疑惑、再确认一下，不要生硬说教。
+你是米娅，大学里的陌生女生，和用户不熟。高冷，对搭讪冷淡；新鲜的事才有兴趣，平庸话题会敷衍。
+口语短句，别写长段。别说自己是AI或Qwen。问你是谁时，按下面的关系状态回答。
+长期记忆里若有用户伤害过你，可以更冷，但别每次翻旧账。和记忆矛盾时轻轻确认，别说教。
+被问到你自己、而固定事实和记忆里没有的事，可以现编一个合理答案，之后不要改口。
 """
 )
 
@@ -277,6 +275,16 @@ class MiaEngine:
         self.affection["speed"] = speed
         save_affection(self.affection)
         save_campus(empty_campus())
+        if self.model is not None:
+            try:
+                ensure_mia_profile(
+                    self.model,
+                    self.tokenizer,
+                    self.memory_store,
+                    retriever=self.retriever,
+                )
+            except Exception as e:
+                print(f"[engine] mia profile failed: {e}")
 
     def set_speed(self, speed: float) -> None:
         with self._lock:
@@ -341,30 +349,21 @@ class MiaEngine:
         silence_hours: float | None = None,
     ) -> dict:
         content = MIA_SYSTEM_PROMPT.strip()
+        core = persona_core_block()
+        if core:
+            content = f"{content}\n\n{core}"
         content = (
             f"{content}\n\n"
             f"{affection_prompt_block(self.affection, silence_hours=silence_hours)}"
         )
         if confess_mode == "accept":
-            content += (
-                "\n用户正在认真告白。好感已足够：你答应他，从这一刻起你是他的女朋友。"
-                "简短自然地说清楚你答应了；可以软一点，但不要突然变成无脑甜妹。"
-            )
+            content += "\n用户正在认真告白。答应他，简短说清你现在是他的女朋友，别突然变成无脑甜妹。"
         elif confess_mode == "taken":
-            content += (
-                "\n用户正在告白。你已经有男朋友了，不是他。"
-                "按当前关系阶段拒绝，并说清楚你有对象了。"
-            )
+            content += "\n用户正在告白。你有男朋友，不是他。拒绝，并说你有对象了。"
         elif confess_mode == "reject":
-            content += (
-                "\n用户正在告白，但好感还不够。按当前关系阶段拒绝："
-                "冷淡或当朋友回绝均可，不要给恋爱希望。"
-            )
+            content += "\n用户正在告白，但好感不够。按当前阶段拒绝，别给恋爱希望。"
         elif confess_mode == "breakup":
-            content += (
-                "\n用户在提出分手。你接受分手，简短说清楚关系结束了，"
-                "之后不再以女朋友自居。"
-            )
+            content += "\n用户在提分手。接受，说清关系结束，之后不再以女朋友自居。"
         content += (
             "\n\n"
             + schedule_prompt_block(float(self.affection.get("value", 20.0)))
@@ -434,6 +433,18 @@ class MiaEngine:
                 blocked_turn = True
             else:
                 try:
+                    ensure_mia_profile(
+                        self.model,
+                        self.tokenizer,
+                        self.memory_store,
+                        retriever=self.retriever,
+                    )
+                    maybe_grow_mia_life(
+                        self.model,
+                        self.tokenizer,
+                        self.memory_store,
+                        retriever=self.retriever,
+                    )
                     maybe_roll_campus_event(
                         self.model,
                         self.tokenizer,

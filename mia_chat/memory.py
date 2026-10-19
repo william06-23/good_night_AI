@@ -50,22 +50,21 @@ MAX_FACTS_PER_TURN = 5
 MEMORY_CONTEXT_MESSAGES = 5
 
 GATE_SYSTEM = (
-    "你是一个记忆筛选器。结合最近对话上下文，判断【最新用户这句话】是否包含值得长期记住的信息。"
-    "值得记住：个人事实、身份、地点、计划、关系、承诺、重要情绪；"
-    "以及各类偏好与喜好（喜欢/讨厌的食物、颜色、活动、习惯、口味等），即使说得随意也算重要。"
-    "不值得：纯寒暄、无信息的玩笑、一次性语气词、没有新信息的附和。"
-    "若最新一句本身含糊，但结合上文能确定是在陈述偏好或事实，也判 important。"
-    '只输出 JSON，格式严格为：{"important": true} 或 {"important": false}'
+    "你是一个记忆筛选器。结合最近对话，判断【最新一轮】是否值得长期记住。"
+    "值得记住：用户的个人事实、身份、地点、计划、关系、承诺、偏好；"
+    "以及米娅在回复里明确说出的、关于她自己的稳定事实（专业、住处、喜好、经历）。"
+    "不值得：纯寒暄、玩笑、一次性语气、没有新信息的附和。米娅的玩笑不当成事实。"
+    '只输出 JSON：{"important": true} 或 {"important": false}'
 )
 
 REWRITE_SYSTEM = (
-    "你是一个记忆整理器。根据最近对话上下文，把【最新一轮】里值得长期记住的信息改写成简短客观陈述句。"
-    "必须结合上文理解指代与省略（例如接上一句才知道在说什么），不要脱离语境乱写。"
-    "只提炼关于用户的稳定信息；不要把米娅的玩笑话当成用户事实。"
-    "默认只输出 1 条事实。只有最新一轮明确含两个互不相关的独立信息时，才拆成多条（最多5条）。"
-    "偏好要写成明确陈述（如「用户喜欢…」）。没有可记内容则输出空数组。"
-    "用中文或英文与原文一致即可，不要撒娇口吻，不要第一人称（用名字或“用户”）。"
-    '只输出 JSON，格式严格为：{"facts": ["事实1", ...]}'
+    "你是一个记忆整理器。把【最新一轮】里值得长期记住的信息改写成简短客观陈述句。"
+    "用户的事实主语用「用户」。米娅关于自己说出的稳定事实主语用「米娅」，不要写成用户的事实。"
+    "米娅的玩笑、敷衍、不确定的话不要记。"
+    "facts：普通事实（用户的，或米娅的次要小事）。没有则空数组。最多5条。"
+    "mia_core：只有米娅刚说出、且下面「已有固定人设」里还没有的重要身份"
+    "（专业、年级、住哪里、一个长期喜好）。否则空数组。最多1条。"
+    '只输出 JSON：{"facts": ["事实1"], "mia_core": []}'
 )
 
 INTRO_SYSTEM = (
@@ -240,8 +239,7 @@ def format_facts_for_prompt(facts: list[dict] | list[str], max_facts: int = 40) 
     if not lines:
         return ""
     return (
-        "已知长期记忆（用户的事，或米娅自己的校园经历；"
-        "聊天时可自然用到，不要逐条念出来）：\n" + "\n".join(lines)
+        "长期记忆（自然用到，别逐条念）：\n" + "\n".join(lines)
     )
 
 
@@ -560,32 +558,43 @@ def summarize_facts(
     user_text: str,
     assistant_text: str = "",
     history: list[dict] | None = None,
-) -> list[str]:
-    """Rewrite important content into one or more short factual sentences."""
+) -> tuple[list[str], list[str]]:
+    """Rewrite the turn into ordinary facts and at most one new core fact about Mia."""
     user_blob = _format_recent_dialogue(history, user_text, assistant_text)
+    try:
+        from .schedule import load_campus
+
+        core = load_campus().get("core") or []
+    except Exception:
+        core = []
+    if core:
+        user_blob += "\n【已有固定人设】\n" + "\n".join(core)
     obj = _generate_json(
         model, tokenizer, REWRITE_SYSTEM, user_blob, REWRITE_MAX_NEW_TOKENS
     )
     if not obj:
-        return []
-    raw = obj.get("facts")
-    out: list[str] = []
-    if isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, str) and item.strip():
-                out.append(item.strip())
-    # Backward-compatible single-fact key.
-    elif isinstance(obj.get("fact"), str) and obj["fact"].strip():
-        out.append(obj["fact"].strip())
-    # Dedupe within this turn (normalized).
+        return [], []
+
+    def _strings(raw) -> list[str]:
+        out: list[str] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str) and item.strip():
+                    out.append(item.strip())
+        return out
+
+    facts = _strings(obj.get("facts"))
+    if not facts and isinstance(obj.get("fact"), str) and obj["fact"].strip():
+        facts = [obj["fact"].strip()]
+    mia_core = _strings(obj.get("mia_core"))[:1]
     seen: set[str] = set()
     unique: list[str] = []
-    for t in out[:MAX_FACTS_PER_TURN]:
+    for t in facts[:MAX_FACTS_PER_TURN]:
         key = _normalize(t)
         if key and key not in seen:
             seen.add(key)
             unique.append(t)
-    return unique
+    return unique, mia_core
 
 
 def score_introduction(model, tokenizer, user_text: str, fact_text: str) -> float:
@@ -810,10 +819,14 @@ def extract_and_store(
     ):
         print("[memory] not important — skip")
         return []
-    fact_texts = summarize_facts(
+    fact_texts, mia_core = summarize_facts(
         model, tokenizer, user_text, assistant_text, history=history
     )
-    if not fact_texts:
+    if mia_core:
+        from .schedule import append_core_facts
+
+        append_core_facts(mia_core)
+    if not fact_texts and not mia_core:
         print("[memory] rewrite returned no facts — skip")
         return []
 

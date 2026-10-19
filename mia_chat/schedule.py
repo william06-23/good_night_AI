@@ -35,14 +35,14 @@ WEEKLY: dict[int, list[tuple[int, int, str]]] = {
     0: [
         _WEEKDAY_MORNING,
         _LUNCH,
-        (14, 17, "下午在图书馆写新闻学作业"),
+        (14, 17, "下午在图书馆写专业课作业"),
         _DINNER,
         _DORM_NIGHT,
     ],
     1: [
         (8, 12, "上午有课，在教学楼"),
         _LUNCH,
-        (14, 16, "下午去学生会开短会"),
+        (14, 16, "下午有社团或校园活动"),
         (16, 17, "会后在校园里走走"),
         _DINNER,
         _DORM_NIGHT,
@@ -101,7 +101,7 @@ def _today() -> datetime:
 
 
 def _empty() -> dict:
-    return {"last_roll_date": "", "events": []}
+    return {"last_roll_date": "", "last_life_date": "", "events": [], "core": []}
 
 
 def load_campus(path: Path = CAMPUS_PATH) -> dict:
@@ -118,9 +118,14 @@ def load_campus(path: Path = CAMPUS_PATH) -> dict:
         events = data.get("events")
         if not isinstance(events, list):
             events = []
+        core = data.get("core")
+        if not isinstance(core, list):
+            core = []
         return {
             "last_roll_date": str(data.get("last_roll_date") or ""),
+            "last_life_date": str(data.get("last_life_date") or ""),
             "events": [e for e in events if isinstance(e, dict)],
+            "core": [str(x).strip() for x in core if str(x).strip()],
         }
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
         return _empty()
@@ -197,25 +202,14 @@ def schedule_prompt_block(affection: float, store: dict | None = None) -> str:
     """What she is doing now, and whether she may bring campus life up herself."""
     now = _today()
     store = store if store is not None else load_campus()
-    label = f"周{_WEEKDAY_NAMES[now.weekday()]} {now.strftime('%H:%M')}"
     lines = [
-        f"当前校园时间：{label}。",
-        f"你此刻在做的事：{activity_now(store, now)}。",
-        "被问到在干嘛时按这个回答，不要临时编一个完全不同的行程。",
+        f"现在是周{_WEEKDAY_NAMES[now.weekday()]} {now.strftime('%H:%M')}，你在：{activity_now(store, now)}。被问到就按这个答，别另编行程。",
     ]
     if float(affection) > FRIEND_ABOVE:
-        lines.append(
-            "你们至少已经算朋友：话题沾边时可以主动提一句自己的校园事"
-            "（考试、活动、最近做过的事），偶尔提，不要每句话都说。"
-        )
         recent = recent_event_lines(store)
         if recent:
-            lines.append("你最近的校园事（可以自然提起，像“上周我也……”）：")
+            lines.append("最近的事：")
             lines.extend(f"- {text}" for text in recent)
-    else:
-        lines.append(
-            "还没到朋友：只有被问到时才简短说自己在做什么，不要主动分享校园生活。"
-        )
     return "\n".join(lines)
 
 
@@ -238,6 +232,142 @@ def _event_conflicts(store: dict, day: str, start: int, end: int) -> bool:
         if start < other_end and end > other_start:
             return True
     return False
+
+
+def persona_core_block(path: Path = CAMPUS_PATH) -> str:
+    """Important generated facts about Mia. Always in the reply prompt."""
+    core = load_campus(path).get("core") or []
+    if not core:
+        return ""
+    return "关于你的固定事实（问到就按这个说）：\n" + "\n".join(
+        f"- {text}" for text in core[:4]
+    )
+
+
+def _remember_mia_fact(memory_store: dict, text: str, retriever=None, memory_path: Path = MEMORY_PATH) -> None:
+    text = (text or "").strip()
+    if not text or find_string_duplicate(memory_store, text):
+        return
+    entry = add_fact(
+        memory_store,
+        text,
+        certainty=0.9,
+        source="mia",
+        session_new=False,
+    )
+    if entry is None:
+        return
+    save_memory(memory_store, memory_path)
+    if retriever is not None:
+        retriever.add_fact_embedding(entry)
+    print(f"[mia] stored: {text}")
+
+
+PROFILE_SYSTEM = (
+    "为高冷大学生米娅编一份新人设。她和用户不熟，没有男朋友。"
+    "core：3条最重要、始终成立的事实，每条一句，主语是米娅。"
+    "必须包括专业和年级、住哪里、一个稳定喜好。"
+    "minor：3条次要小事，每条一句，不要和 core 重复，不要写用户。"
+    '只输出 JSON：{"core":["...","...","..."],"minor":["...","...","..."]}'
+)
+
+LIFE_SYSTEM = (
+    "给米娅补一条新的次要生活小事，一句，主语是米娅。"
+    "要和已有人设一致，不要重复，不要写用户或恋爱对象。"
+    '只输出 JSON：{"fact":"..."}'
+)
+
+
+def _fact_list(raw) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
+
+
+def ensure_mia_profile(
+    model,
+    tokenizer,
+    memory_store: dict,
+    retriever=None,
+    path: Path = CAMPUS_PATH,
+) -> list[str]:
+    """Create her core identity once. Minor facts go to long-term memory."""
+    store = load_campus(path)
+    if store.get("core"):
+        return list(store["core"])
+    try:
+        obj = _generate_json(model, tokenizer, PROFILE_SYSTEM, "请编一份新人设。", max_new_tokens=220)
+    except Exception as e:
+        print(f"[mia] profile failed: {e}")
+        return []
+    core = _fact_list((obj or {}).get("core"))[:4]
+    minor = _fact_list((obj or {}).get("minor"))[:4]
+    if len(core) < 2:
+        print("[mia] profile discarded")
+        return []
+    store["core"] = core
+    save_campus(store, path)
+    for text in minor:
+        _remember_mia_fact(memory_store, text, retriever)
+    print("[mia] new profile: " + " | ".join(core))
+    return core
+
+
+def append_core_facts(items: list[str], path: Path = CAMPUS_PATH, limit: int = 6) -> None:
+    """Add a defining fact she just stated. Stays in the persona, not the fact list."""
+    fresh = [t.strip() for t in items if isinstance(t, str) and t.strip()]
+    if not fresh:
+        return
+    store = load_campus(path)
+    core = list(store.get("core") or [])
+    known = {t.replace(" ", "") for t in core}
+    for text in fresh:
+        key = text.replace(" ", "")
+        if key in known or len(core) >= limit:
+            continue
+        core.append(text)
+        known.add(key)
+        print(f"[mia] core +: {text}")
+    store["core"] = core
+    save_campus(store, path)
+
+
+def maybe_grow_mia_life(
+    model,
+    tokenizer,
+    memory_store: dict,
+    retriever=None,
+    path: Path = CAMPUS_PATH,
+) -> str | None:
+    """Once a day, sometimes add one minor fact about her to long-term memory."""
+    store = load_campus(path)
+    if not store.get("core"):
+        return None
+    today_s = _today().date().isoformat()
+    if store.get("last_life_date") == today_s:
+        return None
+    store["last_life_date"] = today_s
+    save_campus(store, path)
+    if random.random() > 0.5:
+        print("[mia] no new life detail today")
+        return None
+    blob = "已有人设：\n" + "\n".join(store["core"])
+    try:
+        obj = _generate_json(model, tokenizer, LIFE_SYSTEM, blob, max_new_tokens=80)
+    except Exception as e:
+        print(f"[mia] life detail failed: {e}")
+        return None
+    text = ""
+    if obj and isinstance(obj.get("fact"), str):
+        text = obj["fact"].strip()
+    if not text:
+        return None
+    _remember_mia_fact(memory_store, text, retriever)
+    return text
 
 
 def maybe_roll_campus_event(
