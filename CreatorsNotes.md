@@ -10,3 +10,15 @@ When shut down -> run memory organizer that 1. Checks for redundant facts and co
 
 
 Options to structure: Can run a smaller model for fact extraction but would need to load more parameters onto RAM and is probably not worth it. Maybe could be considered if Chatbot model gets really big and takes really long to run.
+
+Now this one is the upgraded version where you can rizz the model.
+
+The model starts out with a certain affection score and chatting with it can either increase or decrease the affection score.
+Cool features:
+1) The way the model chats changes with affection. Uses ranges to set discrete differences to be more specific. (ex. rather than "treat the user differently based on the affection value" I have "if affection value between 10-20, do this")
+2) The model's behavior does not change at the confession threshold. Hehe. So good luck deciding if its enough.
+3) After you guys start dating and the affection level goes high, she will become clingy. You guys can also just keep it low and be like stranger-dating or something like that. (idk, may change it to she becomes clingy no matter what)
+4) She will remember fights
+5) Affection values change are applied with parabolic weights where maximum change happens at affection = 50 and minimum change happens at both ends
+6) If affection = 0, she will block you.
+7) Small acceleration weight that will boost affection change if it is consecutively positive or consecutively negative.

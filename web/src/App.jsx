@@ -86,6 +86,11 @@ export default function App() {
 
   const [ready, setReady] = useState(false)
   const [factsCount, setFactsCount] = useState(0)
+  const [affection, setAffection] = useState(20)
+  const [blocked, setBlocked] = useState(false)
+  const [accepted, setAccepted] = useState(false)
+  const [hasBoyfriend, setHasBoyfriend] = useState(false)
+  const [speed, setSpeed] = useState(1)
   const [statusKind, setStatusKind] = useState('offline') // offline | choose | loading | ready | error
   const [loadError, setLoadError] = useState('')
   const [messages, setMessages] = useState([])
@@ -95,6 +100,7 @@ export default function App() {
   const [ended, setEnded] = useState(false)
   const [memoryOpen, setMemoryOpen] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [restartOpen, setRestartOpen] = useState(false)
   const bottomRef = useRef(null)
   const inputRef = useRef(null)
   const settingsRef = useRef(null)
@@ -122,6 +128,7 @@ export default function App() {
         content: m.content,
         ts: m.ts || undefined,
         kind: m.kind,
+        blocked: !!m.blocked,
       }))
       setMessages(rows)
       historyLoaded.current = true
@@ -138,6 +145,13 @@ export default function App() {
       if (!historyLoaded.current) loadHistory()
       setReady(!!data.ready)
       setFactsCount(data.facts_count ?? 0)
+      setAffection(
+        typeof data.affection === 'number' ? data.affection : 20,
+      )
+      setBlocked(!!data.blocked)
+      setAccepted(!!data.accepted)
+      setHasBoyfriend(!!data.has_boyfriend)
+      if (typeof data.speed === 'number') setSpeed(data.speed)
       setLoadError(data.load_error || '')
       const phase = data.phase || (data.ready ? 'ready' : 'choose')
       setStatusKind(
@@ -239,15 +253,34 @@ export default function App() {
         ])
         return
       }
-      setMessages((m) => [
-        ...m,
-        {
-          role: 'assistant',
-          content: data.reply,
-          recalled: data.recalled || [],
-          ts: Date.now(),
-        },
-      ])
+      if (typeof data.affection === 'number') setAffection(data.affection)
+      if (data.blocked) setBlocked(true)
+      if (data.accepted) setAccepted(true)
+      if (typeof data.has_boyfriend === 'boolean') {
+        setHasBoyfriend(data.has_boyfriend)
+      }
+      if (data.blocked_message) {
+        setMessages((m) => {
+          const next = [...m]
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i].role === 'user' && next[i].content === message) {
+              next[i] = { ...next[i], blocked: true }
+              break
+            }
+          }
+          return next
+        })
+      } else if (data.reply) {
+        setMessages((m) => [
+          ...m,
+          {
+            role: 'assistant',
+            content: data.reply,
+            recalled: data.recalled || [],
+            ts: Date.now(),
+          },
+        ])
+      }
       if (data.ended) setEnded(true)
       await refreshMemory()
     } catch (e) {
@@ -259,6 +292,51 @@ export default function App() {
       setBusy(false)
       pollHealth()
       inputRef.current?.focus()
+    }
+  }
+
+  async function changeSpeed(value) {
+    const next = Math.min(1.5, Math.max(0.8, Number(value)))
+    setSpeed(next)
+    try {
+      await fetch(`${API}/speed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speed: next }),
+      })
+    } catch {
+      /* keep the slider; next health poll will restore the saved value */
+    }
+  }
+
+  async function confirmRestart() {
+    setBusy(true)
+    try {
+      const res = await fetch(`${API}/restart`, { method: 'POST' })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || `Error ${res.status}`)
+      }
+      const data = await res.json()
+      setMessages([])
+      setFacts([])
+      setFactsCount(data.facts_count ?? 0)
+      setAffection(typeof data.affection === 'number' ? data.affection : 20)
+      setBlocked(false)
+      setAccepted(false)
+      setHasBoyfriend(false)
+      setEnded(false)
+      setRestartOpen(false)
+      await loadHistory()
+      await refreshMemory()
+      await pollHealth()
+    } catch (e) {
+      setMessages((m) => [
+        ...m,
+        { role: 'system', content: String(e.message || e), ts: Date.now() },
+      ])
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -285,6 +363,43 @@ export default function App() {
 
   return (
     <div className="app">
+      {restartOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            if (!busy) setRestartOpen(false)
+          }}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="restart-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="restart-title">{t.restartTitle}</h2>
+            <p>{t.restartBody}</p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="header-btn"
+                onClick={() => setRestartOpen(false)}
+                disabled={busy}
+              >
+                {t.restartCancel}
+              </button>
+              <button
+                type="button"
+                className="header-btn danger solid"
+                onClick={confirmRestart}
+                disabled={busy}
+              >
+                {t.restartConfirm}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="phone">
         <header className="chat-header">
           <div className="peer">
@@ -297,7 +412,8 @@ export default function App() {
             <div>
               <h1>{t.name}</h1>
               <p className="status">
-                {statusKind === 'ready' && t.online(factsCount)}
+                {statusKind === 'ready' &&
+                  t.online(factsCount, affection, blocked, accepted, hasBoyfriend)}
                 {statusKind === 'offline' && t.apiOffline}
                 {statusKind === 'choose' && t.pickTitle}
                 {statusKind === 'error' && (loadError || t.loadFailed)}
@@ -341,6 +457,21 @@ export default function App() {
                       <option value="en">English</option>
                     </select>
                   </label>
+                  <label className="settings-row" htmlFor="speed-range">
+                    <span>
+                      {t.speed} {Number(speed).toFixed(2)}
+                    </span>
+                    <input
+                      id="speed-range"
+                      type="range"
+                      min="0.8"
+                      max="1.5"
+                      step="0.05"
+                      value={speed}
+                      onChange={(e) => changeSpeed(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </label>
                 </div>
               )}
             </div>
@@ -359,6 +490,14 @@ export default function App() {
               disabled={busy}
             >
               {t.newSession}
+            </button>
+            <button
+              type="button"
+              className="header-btn danger"
+              onClick={() => setRestartOpen(true)}
+              disabled={busy || statusKind === 'offline'}
+            >
+              {t.restart}
             </button>
           </div>
         </header>
@@ -434,8 +573,21 @@ export default function App() {
                           align="left"
                         />
                       )}
+                      {mine && msg.blocked && (
+                        <span
+                          className="blocked-bang"
+                          title={t.blockedHint}
+                          aria-label={t.blockedHint}
+                        >
+                          !
+                        </span>
+                      )}
                       <div className={`bubble-wrap ${mine ? 'mine' : 'them'}`}>
-                        <div className={`bubble ${mine ? 'mine' : 'them'}`}>
+                        <div
+                          className={`bubble ${mine ? 'mine' : 'them'}${
+                            msg.blocked ? ' blocked' : ''
+                          }`}
+                        >
                           <div className="body">{msg.content}</div>
                           {msg.recalled?.length > 0 && (
                             <div className="recalled">
@@ -548,7 +700,13 @@ export default function App() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={onKeyDown}
-                placeholder={ended ? t.placeholderEnded : t.placeholder}
+                placeholder={
+                  ended
+                    ? t.placeholderEnded
+                    : blocked
+                      ? t.placeholderBlocked
+                      : t.placeholder
+                }
                 disabled={!ready || busy || ended}
               />
               <button

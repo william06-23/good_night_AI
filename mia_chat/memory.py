@@ -239,7 +239,10 @@ def format_facts_for_prompt(facts: list[dict] | list[str], max_facts: int = 40) 
                 lines.append(f"- {text}")
     if not lines:
         return ""
-    return "已知长期记忆（与用户相关，聊天时可自然用到，不要逐条念出来）：\n" + "\n".join(lines)
+    return (
+        "已知长期记忆（用户的事，或米娅自己的校园经历；"
+        "聊天时可自然用到，不要逐条念出来）：\n" + "\n".join(lines)
+    )
 
 
 class MemoryRetriever:
@@ -730,6 +733,57 @@ def _store_one_fact(
     if retriever is not None:
         retriever.add_fact_embedding(entry)
     print(f"[memory] saved (certainty={certainty:.2f}): {fact_text}")
+    return entry
+
+
+HURT_FACT_SYSTEM = (
+    "把这一轮里用户让米娅不舒服或受伤的地方写成一条长期记忆。"
+    "一句话，客观，主语是用户，不要撒娇，不要夸大。"
+    "若其实没有实质伤害，fact 用空字符串。"
+    '只输出 JSON：{"fact": "……"}'
+)
+
+
+def store_hurt_fact(
+    model,
+    tokenizer,
+    store: dict,
+    user_text: str,
+    history: list[dict] | None = None,
+    path: Path = MEMORY_PATH,
+    retriever: MemoryRetriever | None = None,
+) -> dict | None:
+    """Remember one grudge when a turn was seriously negative."""
+    blob = _format_recent_dialogue(
+        history, user_text, assistant_text="", max_messages=MEMORY_CONTEXT_MESSAGES
+    )
+    try:
+        obj = _generate_json(
+            model, tokenizer, HURT_FACT_SYSTEM, blob, max_new_tokens=96
+        )
+    except Exception as e:
+        print(f"[memory] hurt fact failed: {e}")
+        return None
+    text = ""
+    if obj:
+        raw = obj.get("fact")
+        if isinstance(raw, str):
+            text = raw.strip()
+    if not text:
+        print("[memory] hurt fact empty — skip")
+        return None
+    if find_string_duplicate(store, text):
+        print("[memory] hurt fact duplicate — skip")
+        return None
+    entry = add_fact(
+        store, text, certainty=0.8, source="conflict", session_new=True
+    )
+    if entry is None:
+        return None
+    save_memory(store, path)
+    if retriever is not None:
+        retriever.add_fact_embedding(entry)
+    print(f"[memory] hurt saved: {text}")
     return entry
 
 

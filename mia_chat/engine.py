@@ -15,13 +15,49 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from .chat_log import log_turn, new_session_id, start_session
+from .affection import (
+    BREAKUP_BELOW,
+    CLINGY_ABOVE,
+    CONFESS_THRESHOLD,
+    absence_penalty,
+    affection_prompt_block,
+    accelerate_affection_delta,
+    apply_affection_delta,
+    format_affection_display,
+    HURT_RAW_DELTA,
+    judge_relationship_intent,
+    catch_up_boyfriend,
+    clamp_speed,
+    _empty_store as empty_affection,
+    load_affection,
+    parabolic_speed_weight,
+    save_affection,
+    scale_by_user_speed,
+    score_affection_delta,
+    weighted_affection_delta,
+)
+from .chat_log import (
+    clear_log,
+    hours_since_last_user_message,
+    log_turn,
+    new_session_id,
+    start_session,
+)
 from .memory import (
     MemoryRetriever,
     extract_and_store,
     format_facts_for_prompt,
+    _empty_store as empty_memory,
     load_memory,
     organize_memory,
+    save_memory,
+    store_hurt_fact,
+)
+from .schedule import (
+    _empty as empty_campus,
+    maybe_roll_campus_event,
+    save_campus,
+    schedule_prompt_block,
 )
 
 # CUDA 12 runtime DLLs required by the llama-cpp-python Windows CUDA wheel.
@@ -53,16 +89,15 @@ EXIT_PHRASES = {"good night", "night night", "晚安", "exit"}
 
 MIA_SYSTEM_PROMPT = (
     """
-你是米娅，我的女朋友。说话温柔自然，口语化。
-性格：甜美，有点小调皮，会撒娇，关心人。
-回复简短自然，不要写很长大段文字。
-如果别人问你是谁，就说你是米娅，我的女朋友。
+你是米娅，大学里一个普通的陌生女生，和用户并不熟。
+性格：高冷，话不多，对搭讪习惯性冷淡；追求过你的人不少，你大都拒绝了。
+你对新鲜、特别、不一样的事物和想法更感兴趣，平庸话题容易显得敷衍。
+若长期记忆里写到用户伤害过你，你可以更冷、记着这件事，但不要每一句都翻出来。
+说话自然口语化，简短，不要写很长段落，也不要突然变得黏人或撒娇。
+如果别人问你是谁，就说你是米娅，同校的学生。
 绝对不要提到你是AI、大模型或者Qwen。
 全程保持这个身份聊天。
 若用户说的话和已知长期记忆明显矛盾，可以轻轻表示疑惑、再确认一下，不要生硬说教。
-指代：用户说的「你/you」=米娅（你自己）；「我/I」=用户。你必须用「我」自称，用「你」称呼用户，不要把「你」当成用户。
-动作吩咐（如「去吃饭」「过来」「帮我拿…」）是叫你去做，别反过来叫用户做。
-互动请求（如「猜一猜」「讲个笑话」「陪我聊…」）要当场接住：直接猜、直接说，不要只回「好呀我去…」却不做内容。
 """
 )
 
@@ -91,6 +126,7 @@ class MiaEngine:
         self.retriever: MemoryRetriever | None = None
         # Load long-term facts immediately so the UI can show them before model pick.
         self.memory_store: dict = load_memory()
+        self.affection: dict = load_affection()
         self.history: list[dict] = []
         self.session_id: str = ""
         self.ready = False
@@ -226,18 +262,51 @@ class MiaEngine:
         if log_break:
             start_session(self.session_id)
 
+    def restart_all(self) -> None:
+        """Wipe chat, long-term memory, campus events, and relationship state."""
+        self.history = []
+        self.ended = False
+        self.session_id = new_session_id()
+        clear_log()
+        self.memory_store = empty_memory()
+        save_memory(self.memory_store)
+        if self.retriever is not None:
+            self.retriever.rebuild(self.memory_store)
+        speed = clamp_speed((self.affection or {}).get("speed", 1))
+        self.affection = empty_affection()
+        self.affection["speed"] = speed
+        save_affection(self.affection)
+        save_campus(empty_campus())
+
+    def set_speed(self, speed: float) -> None:
+        with self._lock:
+            aff = self.affection or load_affection()
+            self.affection = aff
+            aff["speed"] = clamp_speed(speed)
+            save_affection(aff)
+
     def status(self) -> dict[str, Any]:
-        return {
-            "ready": self.ready,
-            "phase": self.phase,
-            "model_key": self.model_key,
-            "load_error": self.load_error,
-            "models": self.list_models(),
-            "ended": self.ended,
-            "session_id": self.session_id,
-            "facts_count": len(self.memory_store.get("facts") or []),
-            "history_turns": len(self.history),
-        }
+        with self._lock:
+            aff = self.affection or load_affection()
+            self.affection = aff
+            catch_up_boyfriend(aff)
+            return {
+                "ready": self.ready,
+                "phase": self.phase,
+                "model_key": self.model_key,
+                "load_error": self.load_error,
+                "models": self.list_models(),
+                "ended": self.ended,
+                "session_id": self.session_id,
+                "facts_count": len(self.memory_store.get("facts") or []),
+                "history_turns": len(self.history),
+                "affection": float(aff.get("value", 20.0)),
+                "blocked": bool(aff.get("blocked")),
+                "accepted": bool(aff.get("accepted")),
+                "has_boyfriend": bool(aff.get("has_boyfriend")),
+                "speed": clamp_speed(aff.get("speed", 1)),
+                "confess_threshold": float(CONFESS_THRESHOLD),
+            }
 
     def get_memory(self) -> dict:
         return self.memory_store
@@ -264,8 +333,42 @@ class MiaEngine:
             trimmed.pop(0)
         return trimmed
 
-    def _build_system_msg(self, retrieved_facts: list | None) -> dict:
+    def _build_system_msg(
+        self,
+        retrieved_facts: list | None,
+        *,
+        confess_mode: str | None = None,
+        silence_hours: float | None = None,
+    ) -> dict:
         content = MIA_SYSTEM_PROMPT.strip()
+        content = (
+            f"{content}\n\n"
+            f"{affection_prompt_block(self.affection, silence_hours=silence_hours)}"
+        )
+        if confess_mode == "accept":
+            content += (
+                "\n用户正在认真告白。好感已足够：你答应他，从这一刻起你是他的女朋友。"
+                "简短自然地说清楚你答应了；可以软一点，但不要突然变成无脑甜妹。"
+            )
+        elif confess_mode == "taken":
+            content += (
+                "\n用户正在告白。你已经有男朋友了，不是他。"
+                "按当前关系阶段拒绝，并说清楚你有对象了。"
+            )
+        elif confess_mode == "reject":
+            content += (
+                "\n用户正在告白，但好感还不够。按当前关系阶段拒绝："
+                "冷淡或当朋友回绝均可，不要给恋爱希望。"
+            )
+        elif confess_mode == "breakup":
+            content += (
+                "\n用户在提出分手。你接受分手，简短说清楚关系结束了，"
+                "之后不再以女朋友自居。"
+            )
+        content += (
+            "\n\n"
+            + schedule_prompt_block(float(self.affection.get("value", 20.0)))
+        )
         memory_block = format_facts_for_prompt(retrieved_facts or [])
         if memory_block:
             content = f"{content}\n\n{memory_block}"
@@ -306,8 +409,7 @@ class MiaEngine:
 
     def chat(self, user_text: str) -> dict[str, Any]:
         """
-        One turn: recall → reply → log → extract or organize.
-        Returns reply, recalled facts, and whether the session ended.
+        One turn: affection check → recall → reply → log → extract or organize.
         """
         if not self.ready:
             raise RuntimeError("Engine not loaded")
@@ -319,42 +421,165 @@ class MiaEngine:
             raise ValueError("Empty message")
 
         with self._lock:
-            hits = self.retriever.retrieve(user_text)
-            system_msg = self._build_system_msg(hits)
-            self.history.append({"role": "user", "content": user_text})
-            reply = self._generate(system_msg, self.history)
-            self.history.append({"role": "assistant", "content": reply})
-            log_turn(user_text, reply, self.session_id)
+            self.affection = load_affection()
+            catch_up_boyfriend(self.affection)
+            hits: list = []
+            reply = ""
+            blocked_turn = False
 
-            ended = user_text.lower() in EXIT_PHRASES
-            if ended:
-                try:
-                    organize_memory(
-                        self.model,
-                        self.tokenizer,
-                        self.memory_store,
-                        retriever=self.retriever,
-                    )
-                    self.retriever.rebuild(self.memory_store)
-                except Exception as e:
-                    # Never fail the goodbye reply because organize crashed.
-                    print(f"[engine] organize_memory failed (kept reply): {e}")
-                self.ended = True
+            # Already blocked: log the bounce, no reply.
+            if self.affection.get("blocked"):
+                self.history.append({"role": "user", "content": user_text})
+                log_turn(user_text, "", self.session_id, blocked=True)
+                blocked_turn = True
             else:
                 try:
-                    extract_and_store(
+                    maybe_roll_campus_event(
                         self.model,
                         self.tokenizer,
                         self.memory_store,
-                        user_text,
-                        reply,
                         retriever=self.retriever,
-                        recalled_hits=hits,
-                        history=self.history,
                     )
                 except Exception as e:
-                    print(f"[engine] extract_and_store failed (kept reply): {e}")
+                    print(f"[engine] campus event failed: {e}")
+                hits = self.retriever.retrieve(user_text)
+                self.history.append({"role": "user", "content": user_text})
 
+                silence_hours = None
+                if (
+                    self.affection.get("accepted")
+                    and float(self.affection.get("value", 0.0)) > CLINGY_ABOVE
+                ):
+                    silence_hours = hours_since_last_user_message()
+                    gap = absence_penalty(silence_hours)
+                    gap, pace = scale_by_user_speed(self.affection, gap)
+                    if gap < 0:
+                        before_gap = float(self.affection.get("value", 0.0))
+                        apply_affection_delta(self.affection, gap)
+                        print(
+                            f"[affection] absence {silence_hours:.1f}h "
+                            f"{format_affection_display(before_gap)} "
+                            f"{gap:+.2f} → "
+                            f"{format_affection_display(self.affection.get('value', 0))}"
+                        )
+
+                # Score affection from this message + recent context, then maybe block.
+                before = float(self.affection.get("value", 20.0))
+                try:
+                    raw_delta = score_affection_delta(
+                        self.model,
+                        self.tokenizer,
+                        self.history,
+                        user_text,
+                        recalled_hits=hits,
+                    )
+                except Exception as e:
+                    print(f"[engine] affection delta failed: {e}")
+                    raw_delta = 0.0
+                curve = parabolic_speed_weight(before)
+                delta = weighted_affection_delta(raw_delta, before)
+                delta, streak_mult = accelerate_affection_delta(self.affection, delta)
+                delta, pace = scale_by_user_speed(self.affection, delta)
+                apply_affection_delta(self.affection, delta)
+                after = float(self.affection.get("value", 0.0))
+                print(
+                    f"[affection] {format_affection_display(before)} "
+                    f"raw={raw_delta:+.2f}×{curve:.2f}×streak{streak_mult:.2f}"
+                    f"×pace{pace:.2f} "
+                    f"→ {delta:+.2f} "
+                    f"→ {format_affection_display(after)} "
+                    f"(streak={self.affection.get('streak')})"
+                )
+                if raw_delta <= HURT_RAW_DELTA:
+                    try:
+                        store_hurt_fact(
+                            self.model,
+                            self.tokenizer,
+                            self.memory_store,
+                            user_text,
+                            history=self.history,
+                            retriever=self.retriever,
+                        )
+                    except Exception as e:
+                        print(f"[engine] hurt fact failed: {e}")
+
+                if self.affection.get("blocked"):
+                    log_turn(user_text, "", self.session_id, blocked=True)
+                    blocked_turn = True
+                else:
+                    intent = judge_relationship_intent(
+                        self.model, self.tokenizer, self.history, user_text
+                    )
+                    confess_mode = None
+                    user_breakup = bool(
+                        intent.get("breakup") and self.affection.get("accepted")
+                    )
+                    if user_breakup:
+                        confess_mode = "breakup"
+                    elif intent.get("confession") and not self.affection.get("accepted"):
+                        if self.affection.get("has_boyfriend"):
+                            confess_mode = "taken"
+                        elif after >= CONFESS_THRESHOLD:
+                            confess_mode = "accept"
+                        else:
+                            confess_mode = "reject"
+
+                    breakup = bool(
+                        user_breakup
+                        or (
+                            self.affection.get("accepted") and after < BREAKUP_BELOW
+                        )
+                    )
+
+                    system_msg = self._build_system_msg(
+                        hits,
+                        confess_mode=confess_mode,
+                        silence_hours=silence_hours,
+                    )
+                    reply = self._generate(system_msg, self.history)
+                    self.history.append({"role": "assistant", "content": reply})
+                    log_turn(user_text, reply, self.session_id)
+
+                    if confess_mode == "accept":
+                        self.affection["accepted"] = True
+                        save_affection(self.affection)
+                    elif breakup:
+                        self.affection["accepted"] = False
+                        save_affection(self.affection)
+
+                    ended = user_text.lower() in EXIT_PHRASES
+                    if ended:
+                        try:
+                            organize_memory(
+                                self.model,
+                                self.tokenizer,
+                                self.memory_store,
+                                retriever=self.retriever,
+                            )
+                            self.retriever.rebuild(self.memory_store)
+                        except Exception as e:
+                            print(
+                                f"[engine] organize_memory failed (kept reply): {e}"
+                            )
+                        self.ended = True
+                    else:
+                        try:
+                            extract_and_store(
+                                self.model,
+                                self.tokenizer,
+                                self.memory_store,
+                                user_text,
+                                reply,
+                                retriever=self.retriever,
+                                recalled_hits=hits,
+                                history=self.history,
+                            )
+                        except Exception as e:
+                            print(
+                                f"[engine] extract_and_store failed (kept reply): {e}"
+                            )
+
+            ended = self.ended
             return {
                 "reply": reply,
                 "recalled": [
@@ -376,4 +601,11 @@ class MiaEngine:
                 "ended": ended,
                 "facts_count": len(self.memory_store.get("facts") or []),
                 "session_id": self.session_id,
+                "affection": float(self.affection.get("value", 0.0)),
+                "blocked": bool(
+                    self.affection.get("blocked") or blocked_turn
+                ),
+                "accepted": bool(self.affection.get("accepted")),
+                "has_boyfriend": bool(self.affection.get("has_boyfriend")),
+                "blocked_message": blocked_turn,
             }

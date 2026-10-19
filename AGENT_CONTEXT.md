@@ -1,149 +1,113 @@
 # Good Night AI — agent context
 
-Use this document when continuing work on this repo. Prefer small, focused changes. Do not invent FastAPI/RAG layers unless asked. Models and the Python venv live **outside** this folder.
+Use this document when continuing work on this repo. Prefer small, focused changes. Do not invent extra services unless asked. Models and the Python venv live **outside** this folder.
+
+Current branch for the dating sim is **Rizz-the-AI**. `master` is the earlier girlfriend CLI.
 
 ## What this project is
 
-A local CLI girlfriend chat named **Mia**. One NVIDIA GPU runs a 4-bit Qwen chat model. Long-term memory is a JSON file of short facts with certainty scores. An embedding model (**bge-m3**, CPU) retrieves which facts to inject each turn. After the user says good night, Mia replies once, then a consolidation pass cleans the JSON.
+A local chat with **Mia**, a cold university stranger. One NVIDIA GPU runs Qwen (7B bitsandbytes or 14B GGUF). Long-term memory is a JSON file of short facts with certainty scores. **bge-m3** (CPU) retrieves which facts to inject each turn. Affection, dating, a possible boyfriend, and a fixed campus week change how she talks.
+
+The usual way to run it is the web UI: `run_web.bat` (API on port 8000, Vite on 5173). `run_mia.bat` still starts the CLI.
 
 ## External dependencies (not in this repo)
 
 | Asset | Typical path on the author’s machine | Device |
 |-------|--------------------------------------|--------|
 | Chat model `Qwen2.5-7B-Instruct-bnb-4bit` | `C:\Users\William\William's_AI_project\Qwen2.5-7B-Instruct-bnb-4bit` | GPU (`device_map="auto"`) |
+| Chat model `Qwen2.5-14B-Instruct-Q4_K_M.gguf` | `C:\Users\William\William's_AI_project\Qwen2.5-14B-Instruct-GGUF\` | GPU layers + RAM (`llama-cpp-python`) |
+| CUDA 12 runtime for the GGUF wheel | `C:\Users\William\William's_AI_project\llama_cpp_cudart12` | — |
 | Retriever `BAAI/bge-m3` | `C:\Users\William\William's_AI_project\bge-m3` | CPU |
 | Python env | `C:\Users\William\William's_AI_project\torch_env` | — |
 
-Packages: `torch` (CUDA), `transformers`, `accelerate`, `bitsandbytes`, `sentence-transformers`, `huggingface_hub`.
-
-Run: double-click `run_mia.bat`, or with venv active: `python mia_chat\chat_cli.py`.
+Packages: `torch` (CUDA), `transformers`, `accelerate`, `bitsandbytes`, `sentence-transformers`, `llama-cpp-python`, `fastapi`, `uvicorn`.
 
 ---
 
 ## File map
 
-### `run_mia.bat`
+### Launchers
 
-Launcher. `cd`s to the repo root and runs `torch_env\Scripts\python.exe mia_chat\chat_cli.py`. On another machine, edit the Python path. If the script errors, `pause` keeps the window open.
+- `run_web.bat` — API window + Vite. This is the Rizz UI.
+- `run_api.bat` — uvicorn `mia_chat.api:app` on `127.0.0.1:8000`. Model loads only after the UI picks 7B or 14B.
+- `run_mia.bat` — CLI via `mia_chat/chat_cli.py`.
 
-### `README.md`
+### `mia_chat/engine.py`
 
-Human setup guide: hardware, pip install, model paths, how to run. Keep in sync when paths or packages change.
+Shared engine for CLI and FastAPI. Loads Qwen + bge-m3 once. Short-term `history` stays in RAM and is trimmed to `MAX_PROMPT_TOKENS`.
 
-### `AGENT_CONTEXT.md`
+Persona is `MIA_SYSTEM_PROMPT`: a cold campus stranger, not a girlfriend, until affection accepts a confession. Do not mention being an AI.
 
-This file. Orientation for agents / future you.
+One chat turn, inside the engine lock:
 
-### `mia_chat/__init__.py`
+1. Catch up the daily boyfriend roll.
+2. Maybe add one campus event (at most once per local day).
+3. Retrieve up to 5 facts.
+4. If she is clingy (dating and affection **> 85**), apply an absence penalty from waking hours since the last user line.
+5. Ask the model for an affection delta, then apply parabolic weight, streak, and the user speed.
+6. A raw delta **≤ −8** stores one hurt fact.
+7. If blocked (affection hit 0), log the user line and do not reply.
+8. Otherwise judge confession / breakup, build the system prompt (persona + affection tone + schedule + recalled facts), generate, log.
+9. Exit phrases (`good night`, `night night`, `晚安`, `exit`): she replies first, then `organize_memory`. Other turns call `extract_and_store`.
 
-Marks `mia_chat` as a package. Nearly empty.
+**New session** (`reset_session`) clears RAM history only. Transcript, long-term memory, and affection stay.
 
-### `mia_chat/chat_cli.py`
+**重新开始** (`restart_all`) wipes the transcript, long-term facts, campus events, and relationship state. The loaded model stays. The affection **speed** slider is kept.
 
-**Main entrypoint.** Responsibilities:
+### `mia_chat/api.py` and `web/`
 
-- Load Qwen 4-bit once (`MODEL_ID`).
-- Load `MemoryRetriever` (bge-m3 on CPU) and `long_term_memory.json`.
-- Interactive stdin loop.
-- **Short-term memory:** in-RAM `history` list of `{role, content}`; forgotten when the process exits. Trimmed by `trim_history_to_budget` for the prompt token cap (`MAX_PROMPT_TOKENS`).
-- Each turn:
-  1. Retrieve top facts for the user text (`MemoryRetriever.retrieve`).
-  2. Build system prompt = Mia persona + only those recalled facts.
-  3. Generate Mia’s reply on GPU.
-  4. If user text is an exit phrase (`good night`, `night night`, `晚安`, `exit`): print Mia’s reply, then call `organize_memory`, rebuild retriever, exit. **Do not** run `extract_and_store` on the goodbye turn.
-  5. Otherwise call `extract_and_store(...)` with `recalled_hits` for certainty context.
-- Persona: `MIA_SYSTEM_PROMPT` (Chinese girlfriend persona; gentle confusion if user contradicts recalled memory).
+FastAPI: health, model pick, chat, history, memory, session reset, full restart, `POST /api/speed`.
 
-When editing chat behavior, start here. When editing memory logic, edit `memory.py` and only wire from here.
+The React UI (`web/src/App.jsx`) is a messenger layout: history with dates, memory panel, language, affection in the status line, and the speed slider in settings (0.8–1.5, default 1). Restart asks for confirmation before deleting anything.
+
+### `mia_chat/affection.py`
+
+Persisted in `mia_chat/data/affection.json` (gitignored). Starts at **20**. Hard bounds **0–100**. **0 blocks** her.
+
+| Piece | Behavior |
+|-------|----------|
+| Tone bands | ≤10 cold / sarcastic, rarely asks questions; ≤40 polite stranger, rarely asks; ≤70 friend; &lt;80 close but will not accept a confession; ≥80 will accept |
+| Raw delta | Normal chat about **±0.05–0.4**. Deeply moved (user cares about something that really matters to her, or a real small detail) **+1 to +5**. Fake or hollow caring is a small **minus** (−0.1 to −0.4), not a plus. Severe harm about **−8 to −15**, worst **−50** |
+| Parabolic weight | Fastest change at 50, slowest near 0 and 100 (`SPEED_FLOOR` 0.15) |
+| Streak | 2nd same-sign message ×1.05, up to ×1.20 at the 5th. A flat turn or a sign flip resets it. Absence does not count |
+| User speed | Multiplies every signed change, including absence. Slider 0.8–1.5, default 1. Survives restart |
+| Confession | Model JSON judge, not keywords. Accept at **≥ 80** sets `accepted` (dating on). Below 80 she refuses |
+| Dating off | She asks to break up if affection falls **below 60**, or the judge says the user is breaking up |
+| Clingy | Only while dating and affection **> 85**. More than **6 waking hours** since the last user message costs affection (0.35 per extra hour, cap −20) and she complains. Local **11:00 PM–7:00 AM** is not counted |
+| Boyfriend | Once per new local day, if she is not the user’s girlfriend, roll **1%** per missed day. First open only records `last_access_day`. If it hits, `has_boyfriend` stays on: emotional distance, affection **caps at 60**, mildly intimate lines get “I have a boyfriend”, confessions are refused |
+| Hurt memory | Raw delta ≤ −8 writes one long-term grudge fact (`store_hurt_fact`) |
+
+### `mia_chat/schedule.py`
+
+Fixed local weekly timetable, plus occasional one-off events in `mia_chat/data/campus_life.json` (gitignored). Events are also inserted into long-term memory (`source: campus`) so retrieval can bring them back. She only brings campus life up on her own when affection is **above 40**. Below that she answers “what are you doing” from the timetable and does not volunteer it.
 
 ### `mia_chat/memory.py`
 
-**All long-term memory logic.** Key pieces:
+Long-term facts. Unchanged idea: gate → rewrite up to 5 facts → certainty → bump near-duplicates. Organize on good night compares `session_new` facts (`same` / `contradict` / `unrelated`). Nicknames and likes that can coexist stay `unrelated`.
 
-| Symbol | Role |
-|--------|------|
-| `MEMORY_PATH` | `mia_chat/data/long_term_memory.json` |
-| `EMBED_MODEL_ID` / `EMBED_DEVICE` | bge-m3 path; keep `"cpu"` so VRAM stays with Qwen |
-| `RETRIEVE_TOP_K` / `RETRIEVE_MIN_SCORE` | Recall up to 5 facts if score ≥ 0.25 |
-| `MAX_FACTS_PER_TURN` | Extract at most 5 facts from one user turn |
-| `NEAR_DUP_MIN` | Embedding threshold to bump existing fact instead of insert |
-| `MemoryRetriever` | Encode/index facts; `retrieve`, `best_match`, `rebuild`, `add_fact_embedding` |
-| `load_memory` / `save_memory` | JSON I/O; missing fields normalized (`certainty`, `session_new`, `updated_at`) |
-| `format_facts_for_prompt` | Bullet list for system prompt (includes certainty) |
-| `is_important` | Qwen gate: worth remembering? |
-| `summarize_facts` | Qwen rewrite → `{"facts": ["...", ...]}` (one idea per string) |
-| `score_introduction` / `score_context_match` / `compute_certainty` | Certainty for new facts |
-| `bump_certainty` | User re-hints same fact → raise certainty |
-| `extract_and_store` | Full pipeline for one non-exit turn |
-| `organize_memory` | Post–good-night consolidation |
+New-fact certainty is approximately `0.06 + 0.28*intro + 0.22*context` (about 0.05–0.55).
 
-**Extraction pipeline (one user turn = one `input()`, not “one line of text”):**
-
-1. Gate: important? If no → stop.
-2. Rewrite: up to 5 **independent** atomic facts (not split by newlines).
-3. For each fact separately: exact-string match or very-high embedding match → bump; else insert with certainty. Sibling facts from the **same turn** must not merge into each other (`skip_ids`).
-
-**Certainty (new facts start relatively low):**
-
-`certainty ≈ 0.12 + 0.40 * intro + 0.35 * context` (clamped ~0.05–0.85).  
-`intro` = how assertively the user stated it (Qwen).  
-`context` = similarity of the fact to this turn’s recalled long-term hits (embeddings).
-
-**Organize (after Mia’s last goodbye message):**
-
-- Only facts with `session_new: true` vs other facts.
-- Embedding candidates, then Qwen classifies `same` | `contradict` | `unrelated`.
-- `same` or `contradict`: keep higher certainty, delete the other. Preferable preferences that can both be true → `unrelated` (e.g. likes blue and likes yellow).
-- Clear all `session_new` flags; save JSON; caller rebuilds retriever.
-
-Qwen helper calls use greedy `generate` + strict JSON prompts (`GATE_SYSTEM`, `REWRITE_SYSTEM`, `INTRO_SYSTEM`, `ORGANIZE_SYSTEM`).
+Facts may be about the user **or** Mia’s own campus life and fights. `format_facts_for_prompt` says so.
 
 ### `mia_chat/chat_log.py`
 
-Append-only **user transcript** (`mia_chat/data/chat_log.jsonl`). Saves raw You/Mia lines for the human to read. **Not** used for retrieval, gating, or facts. Gitignored.
-
-### `mia_chat/data/long_term_memory.json`
-
-Persistent long-term store. Shape:
-
-```json
-{
-  "facts": [
-    {
-      "id": "uuid",
-      "text": "short factual sentence",
-      "certainty": 0.0,
-      "created_at": "ISO-8601",
-      "updated_at": "ISO-8601",
-      "source": "chat",
-      "session_new": false
-    }
-  ]
-}
-```
-
-Deleting a fact = remove its object from `facts` and save (or let `organize_memory` drop it). Empty `facts: []` is valid (fresh start).
-
-### `mia_chat/_download_bge_m3.py`
-
-One-shot Hugging Face download of `BAAI/bge-m3` into `EMBED_MODEL_ID`’s folder. Not needed at runtime once weights exist.
+Append-only transcript `mia_chat/data/chat_log.jsonl` (gitignored). The UI loads it. It is **not** model context. It **is** the clock for clingy absence: `hours_since_last_user_message` counts waking hours only.
 
 ---
 
-## Runtime flow (mermaid)
+## Runtime flow
 
 ```mermaid
 flowchart TD
-  start[Start CLI] --> loadEmbed[Load bge-m3 on CPU]
-  loadEmbed --> loadJSON[Load long_term_memory.json]
-  loadJSON --> loadQwen[Load Qwen 4bit on GPU]
-  loadQwen --> loop[User input]
-  loop --> recall[Retrieve top facts CPU]
-  recall --> gen[Generate Mia reply GPU]
-  gen --> exitCheck{Exit phrase?}
+  start[Web or CLI] --> pick[Pick 7B or 14B]
+  pick --> loop[User message]
+  loop --> day[Boyfriend catch-up and maybe a campus event]
+  day --> recall[Retrieve facts]
+  recall --> score[Affection delta plus weights]
+  score --> reply[Reply with persona tone and schedule]
+  reply --> exitCheck{Good night?}
   exitCheck -->|yes| organize[organize_memory]
-  organize --> endNode[Exit]
-  exitCheck -->|no| extract[extract_and_store up to 5 facts]
+  exitCheck -->|no| extract[extract_and_store]
   extract --> loop
 ```
 
@@ -151,18 +115,12 @@ flowchart TD
 
 ## Rules for agents editing this project
 
-1. **Do not** put large model weights inside `Good_night_AI`; only update path constants.
-2. Keep **chat on GPU**, **bge-m3 on CPU** unless the user asks otherwise.
-3. Short-term chat history stays in RAM only; do not log full transcripts unless asked.
-4. Exit phrases: Mia speaks first, **then** organize — never organize before the last reply.
-5. One user turn → one importance gate → many facts (max 5); facts are semantic units, not text lines.
-6. Prefer extending `memory.py` for memory features; keep `chat_cli.py` as the thin loop.
-7. JSON is enough for now; do not migrate to SQLite unless requested.
-8. Match existing style: Chinese prompts for Mia/gates, English comments OK.
-
-## Quick test checklist
-
-- Start chat; trivial hi → `[memory] not important` or no save.
-- “我叫X，住在Y” → `[memory] extracted 2 separate fact(s)` and two JSON rows with `certainty` / `session_new: true`.
-- Contradict a recalled fact → Mia shows mild confusion.
-- Say `晚安` → Mia replies → `[organize]…` → duplicates/contradictions with lower certainty removed.
+1. Do not put model weights inside this repo; only update path constants.
+2. Keep chat on the GPU and bge-m3 on the CPU unless the user asks otherwise.
+3. Short-term history stays in RAM. The JSONL transcript is for the human and for absence timing.
+4. On good night, Mia speaks first, then organize. Do not organize before that reply.
+5. One user turn → one importance gate → up to 5 facts. Do not merge sibling facts from the same turn.
+6. Affection tone lives in `affection_prompt_block`. Do not bake relationship stages into `MIA_SYSTEM_PROMPT`.
+7. Dating is only the `accepted` flag. A boyfriend is a separate flag and blocks a new confession.
+8. Personal runtime files stay gitignored: chat log, long-term memory, affection, campus life.
+9. Match existing style: Chinese prompts for Mia and the judges, English comments are fine.

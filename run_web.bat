@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 echo Starting Mia API in a new window (models load there)...
-start "Mia API" "%~dp0run_api.bat"
+start "Mia Rizz API" "%~dp0run_api.bat"
 
 cd /d "%~dp0web"
 echo Starting Vite — browser opens at http://127.0.0.1:5173

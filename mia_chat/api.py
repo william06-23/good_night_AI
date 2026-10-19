@@ -59,6 +59,11 @@ class ChatResponse(BaseModel):
     ended: bool
     facts_count: int
     session_id: str
+    affection: float = 20.0
+    blocked: bool = False
+    accepted: bool = False
+    has_boyfriend: bool = False
+    blocked_message: bool = False
 
 
 @app.get("/api/health")
@@ -111,10 +116,28 @@ def chat(body: ChatRequest) -> ChatResponse:
     return ChatResponse(**result)
 
 
+class SpeedChoice(BaseModel):
+    speed: float = Field(..., ge=0.8, le=1.5)
+
+
+@app.post("/api/speed")
+def set_speed(body: SpeedChoice) -> dict[str, Any]:
+    engine.set_speed(body.speed)
+    return engine.status()
+
+
 @app.post("/api/session/reset")
 def reset_session() -> dict[str, Any]:
     if not engine.ready:
         raise HTTPException(503, "Engine not ready")
     with engine._lock:
         engine.reset_session()
+    return engine.status()
+
+
+@app.post("/api/restart")
+def restart_all() -> dict[str, Any]:
+    """Erase transcript, memories, and relationship state. Model stays loaded."""
+    with engine._lock:
+        engine.restart_all()
     return engine.status()

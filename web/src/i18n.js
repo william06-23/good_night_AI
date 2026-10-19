@@ -37,7 +37,23 @@ export const STRINGS = {
   zh: {
     name: '米娅',
     you: '你',
-    online: (n) => `在线 · ${n} 条记忆`,
+    online: (n, aff, blocked, accepted, taken) => {
+      const a =
+        typeof aff === 'number'
+          ? Number.isInteger(aff)
+            ? String(aff)
+            : String(Math.round(aff * 100) / 100)
+          : aff
+      return blocked
+        ? `已拉黑 · 好感 ${a}`
+        : accepted
+          ? `在线 · 好感 ${a} · 已答应`
+          : taken
+            ? `在线 · ${n} 条记忆 · 好感 ${a} · 有对象`
+            : `在线 · ${n} 条记忆 · 好感 ${a}`
+    },
+    blockedHint: '已被拉黑，消息发不出去',
+    placeholderBlocked: '已被拉黑…',
     loadingModels: '正在加载模型…',
     loadingWait: '请稍等一两分钟…',
     loadingTitle: '米娅正在“非常努力”地赶来跟你聊天…',
@@ -55,6 +71,12 @@ export const STRINGS = {
     hideMemory: '收起记忆',
     showMemory: '长期记忆',
     newSession: '新会话',
+    restart: '重新开始',
+    restartTitle: '重新开始？',
+    restartBody:
+      '会清空全部聊天记录和长期记忆，好感回到 20，恋爱、拉黑和“有对象”都会取消。',
+    restartConfirm: '清空并重置',
+    restartCancel: '取消',
     sessionBreak: '—— 新会话（模型忘掉刚才的对话）——',
     emptyChat: '打个招呼吧 · 结束时说「晚安」',
     goodNight: '晚安',
@@ -70,12 +92,29 @@ export const STRINGS = {
     noMemory: '暂无记忆',
     settings: '设置',
     language: '界面语言',
+    speed: '好感速度',
     typing: '米娅正在输入',
   },
   en: {
     name: 'Mia',
     you: 'You',
-    online: (n) => `Online · ${n} memories`,
+    online: (n, aff, blocked, accepted, taken) => {
+      const a =
+        typeof aff === 'number'
+          ? Number.isInteger(aff)
+            ? String(aff)
+            : String(Math.round(aff * 100) / 100)
+          : aff
+      return blocked
+        ? `Blocked · affection ${a}`
+        : accepted
+          ? `Online · affection ${a} · said yes`
+          : taken
+            ? `Online · ${n} memories · affection ${a} · has a boyfriend`
+            : `Online · ${n} memories · affection ${a}`
+    },
+    blockedHint: 'You’re blocked — messages won’t get a reply',
+    placeholderBlocked: 'Blocked…',
     loadingModels: 'Loading models…',
     loadingWait: 'Please wait a minute or two…',
     loadingTitle: 'Mia is trying really hard to come talk to you…',
@@ -93,6 +132,12 @@ export const STRINGS = {
     hideMemory: 'Hide memory',
     showMemory: 'Memory',
     newSession: 'New session',
+    restart: 'Restart',
+    restartTitle: 'Start over?',
+    restartBody:
+      'This deletes the whole chat and long-term memory, sets affection back to 20, and clears dating, blocked, and her having a boyfriend.',
+    restartConfirm: 'Delete and reset',
+    restartCancel: 'Cancel',
     sessionBreak: '—— New session (model forgot earlier turns) ——',
     emptyChat: 'Say hi — type good night when you leave',
     goodNight: 'Night',
@@ -108,6 +153,7 @@ export const STRINGS = {
     noMemory: 'No memories yet',
     settings: 'Settings',
     language: 'Language',
+    speed: 'Affection speed',
     typing: 'Mia is typing',
   },
 }
