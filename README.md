@@ -1,6 +1,6 @@
 # Good Night AI (Mia)
 
-Local chat with Mia, your girlfriend. Short-term chat stays in RAM for this session. Important facts are saved to `mia_chat/data/long_term_memory.json`. On each turn, `BAAI/bge-m3` (CPU) retrieves the most relevant facts and injects only those into the prompt.
+Local chat with Mia, your girlfriend. Short-term chat stays in RAM for this session. Long-term memory is multi-perspective JSON in `mia_chat/data/long_term_memory.json` (`Narrator` / `Player` / NPC string lists). On each turn, `BAAI/bge-m3` (CPU) retrieves from those buckets and injects them into the prompt.
 
 You can run Qwen 2.5 **7B** (4-bit, transformers) or **14B** (GGUF, llama.cpp). The web UI asks you to pick one after the API is up. The dating-sim version lives on the `Rizz-the-AI` branch.
 
@@ -76,9 +76,10 @@ set PYTHONPATH=%CD%
 
 - `GET /api/health`
 - `POST /api/model` and `POST /api/model/retry`
-- `GET /api/memory`
+- `GET /api/memory` (character → string lists)
+- `GET /api/characters`
 - `GET /api/chat/history`
-- `POST /api/chat`
+- `POST /api/chat` (optional `character`)
 - `POST /api/session/reset`
 
 ## Private runtime files

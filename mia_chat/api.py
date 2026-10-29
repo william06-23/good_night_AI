@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from .chat_log import load_messages
 from .engine import MiaEngine
-from .memory import load_memory
+from .memory import list_speakable_characters, load_memory, public_memory_store
 
 engine = MiaEngine()
 
@@ -47,6 +47,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
+    character: str | None = None
 
 
 class ModelChoice(BaseModel):
@@ -59,6 +60,7 @@ class ChatResponse(BaseModel):
     ended: bool
     facts_count: int
     session_id: str
+    character: str
 
 
 @app.get("/api/health")
@@ -85,11 +87,20 @@ def retry_model() -> dict[str, Any]:
 
 @app.get("/api/memory")
 def get_memory() -> dict[str, Any]:
-    # Full long-term store (old + new). Available before a chat model is loaded.
+    """Character-keyed string lists (Narrator / Player / NPCs)."""
     store = engine.get_memory()
-    if store.get("facts"):
-        return store
-    return load_memory()
+    public = public_memory_store(store)
+    if any(public.values()):
+        return public
+    return public_memory_store(load_memory())
+
+
+@app.get("/api/characters")
+def get_characters() -> dict[str, Any]:
+    return {
+        "characters": list_speakable_characters(),
+        "active": engine.active_character,
+    }
 
 
 @app.get("/api/chat/history")
@@ -103,7 +114,7 @@ def chat(body: ChatRequest) -> ChatResponse:
     if not engine.ready:
         raise HTTPException(503, "Engine not ready — still loading?")
     try:
-        result = engine.chat(body.message)
+        result = engine.chat(body.message, character=body.character)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except RuntimeError as e:

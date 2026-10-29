@@ -17,9 +17,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from .chat_log import log_turn, new_session_id, start_session
 from .memory import (
+    DEFAULT_CHARACTER,
     MemoryRetriever,
+    count_memories,
     extract_and_store,
     format_facts_for_prompt,
+    is_speakable,
+    list_speakable_characters,
     load_memory,
     organize_memory,
 )
@@ -94,8 +98,9 @@ class MiaEngine:
         self.tokenizer = None
         self.backend: str | None = None
         self.retriever: MemoryRetriever | None = None
-        # Load long-term facts immediately so the UI can show them before model pick.
+        # Load long-term memory immediately so the UI can show it before model pick.
         self.memory_store: dict = load_memory()
+        self.active_character: str = DEFAULT_CHARACTER
         self.history: list[dict] = []
         self.session_id: str = ""
         self.ready = False
@@ -163,8 +168,8 @@ class MiaEngine:
             self.reset_session(log_break=False)
             self.ready = True
             self.phase = "ready"
-            n = len(self.memory_store.get("facts") or [])
-            print(f"Engine ready ({model_key}/{backend}). Long-term facts: {n}")
+            n = count_memories(self.memory_store)
+            print(f"Engine ready ({model_key}/{backend}). Long-term memories: {n}")
         except Exception as e:
             self.ready = False
             self.phase = "error"
@@ -240,12 +245,20 @@ class MiaEngine:
             "models": self.list_models(),
             "ended": self.ended,
             "session_id": self.session_id,
-            "facts_count": len(self.memory_store.get("facts") or []),
+            "facts_count": count_memories(self.memory_store),
+            "active_character": self.active_character,
+            "characters": list_speakable_characters(),
             "history_turns": len(self.history),
         }
 
     def get_memory(self) -> dict:
         return self.memory_store
+
+    def set_active_character(self, character: str) -> None:
+        character = (character or DEFAULT_CHARACTER).strip()
+        if not is_speakable(character):
+            raise ValueError(f"Unknown character: {character}")
+        self.active_character = character
 
     def _count_tokens(self, messages: list) -> int:
         if self.backend == "gguf":
@@ -269,9 +282,9 @@ class MiaEngine:
             trimmed.pop(0)
         return trimmed
 
-    def _build_system_msg(self, retrieved_facts: list | None) -> dict:
+    def _build_system_msg(self, retrieved_hits: list | None) -> dict:
         content = MIA_SYSTEM_PROMPT.strip()
-        memory_block = format_facts_for_prompt(retrieved_facts or [])
+        memory_block = format_facts_for_prompt(retrieved_hits or [])
         if memory_block:
             content = f"{content}\n\n{memory_block}"
         return {"role": "system", "content": content}
@@ -309,10 +322,9 @@ class MiaEngine:
         new_tokens = output_ids[0][inputs["input_ids"].shape[-1] :]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-    def chat(self, user_text: str) -> dict[str, Any]:
+    def chat(self, user_text: str, character: str | None = None) -> dict[str, Any]:
         """
-        One turn: recall → reply → log → extract or organize.
-        Returns reply, recalled facts, and whether the session ended.
+        One turn: triple recall → reply → log → triple extract or organize.
         """
         if not self.ready:
             raise RuntimeError("Engine not loaded")
@@ -324,7 +336,11 @@ class MiaEngine:
             raise ValueError("Empty message")
 
         with self._lock:
-            hits = self.retriever.retrieve(user_text)
+            if character is not None:
+                self.set_active_character(character)
+            who = self.active_character
+
+            hits = self.retriever.retrieve_for_turn(user_text, who)
             system_msg = self._build_system_msg(hits)
             self.history.append({"role": "user", "content": user_text})
             reply = self._generate(system_msg, self.history)
@@ -356,6 +372,7 @@ class MiaEngine:
                         retriever=self.retriever,
                         recalled_hits=hits,
                         history=self.history,
+                        character=who,
                     )
                 except Exception as e:
                     print(f"[engine] extract_and_store failed (kept reply): {e}")
@@ -367,18 +384,12 @@ class MiaEngine:
                         "id": h.get("id"),
                         "text": h.get("text"),
                         "score": h.get("score"),
-                        "certainty": next(
-                            (
-                                f.get("certainty")
-                                for f in (self.memory_store.get("facts") or [])
-                                if f.get("id") == h.get("id")
-                            ),
-                            None,
-                        ),
+                        "character": h.get("character"),
                     }
                     for h in hits
                 ],
                 "ended": ended,
-                "facts_count": len(self.memory_store.get("facts") or []),
+                "facts_count": count_memories(self.memory_store),
                 "session_id": self.session_id,
+                "character": who,
             }

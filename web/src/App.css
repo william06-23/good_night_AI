@@ -554,31 +554,18 @@
   color: #555;
 }
 
-.memory-legend {
+.memory-groups {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.35rem 0.75rem;
-  margin: 0 0 0.55rem;
-  font-size: 0.7rem;
-  color: #888;
+  flex-direction: column;
+  gap: 0.75rem;
 }
 
-.memory-legend .swatch {
-  display: inline-block;
-  width: 0.65rem;
-  height: 0.65rem;
-  border-radius: 2px;
-  margin-right: 0.2rem;
-  vertical-align: -1px;
-}
-
-.memory-legend .swatch.new {
-  background: #4a90e2;
-}
-
-.memory-legend .swatch.old {
-  background: #b0b0b0;
+.memory-group-title {
+  margin: 0 0 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #666;
+  letter-spacing: 0.02em;
 }
 
 .memory ul {
@@ -600,27 +587,8 @@
   gap: 0.15rem;
 }
 
-.memory li.fact-new {
-  background: #eaf3fc;
-  border-color: #b7d4f0;
-  color: #1a4f8a;
-}
-
-.memory li.fact-new em {
-  color: #5a8fc4;
-}
-
 .memory li.fact-old {
   background: #f0f0f0;
   border-color: #e0e0e0;
   color: #777;
-}
-
-.memory li.fact-old em {
-  color: #999;
-}
-
-.memory em {
-  font-style: normal;
-  font-size: 0.7rem;
 }

@@ -27,13 +27,16 @@ def main():
         hits = result.get("recalled") or []
         if hits:
             preview = ", ".join(
-                f"{h['text'][:24]}…({h['score']:.2f})" for h in hits if h.get("text")
+                f"[{h.get('character', '?')}]{h['text'][:24]}…({h['score']:.2f})"
+                for h in hits
+                if h.get("text")
             )
             print(f"[memory] recalled: {preview}")
         else:
             print("[memory] recalled: (none)")
 
-        print(f"Mia: {result['reply']}")
+        who = result.get("character") or "Mia"
+        print(f"{who}: {result['reply']}")
 
         if result.get("ended") or user_text.lower() in EXIT_PHRASES:
             print("[organize] done." if result.get("ended") else "")

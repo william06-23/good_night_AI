@@ -91,7 +91,7 @@ export default function App() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
-  const [facts, setFacts] = useState([])
+  const [memories, setMemories] = useState({})
   const [ended, setEnded] = useState(false)
   const [memoryOpen, setMemoryOpen] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -106,11 +106,26 @@ export default function App() {
       const res = await fetch(`${API}/memory`)
       if (!res.ok) return
       const data = await res.json()
-      setFacts(data.facts || [])
+      // Character-keyed string lists: { Narrator: [...], Player: [...], Mia: [...] }
+      const next = {}
+      if (data && typeof data === 'object' && !Array.isArray(data)) {
+        for (const [key, values] of Object.entries(data)) {
+          if (key.startsWith('_')) continue
+          if (Array.isArray(values)) {
+            next[key] = values.filter((v) => typeof v === 'string' && v.trim())
+          }
+        }
+      }
+      setMemories(next)
     } catch {
       /* ignore until API is up */
     }
   }, [])
+
+  const memoryGroups = Object.entries(memories).filter(
+    ([, texts]) => Array.isArray(texts) && texts.length > 0,
+  )
+  const hasMemories = memoryGroups.length > 0
 
   const loadHistory = useCallback(async () => {
     try {
@@ -583,28 +598,23 @@ export default function App() {
                   </button>
                 </div>
               </div>
-              {facts.length === 0 ? (
+              {!hasMemories ? (
                 <p className="empty">{t.noMemory}</p>
               ) : (
-                <>
-                  <p className="memory-legend">
-                    <span className="swatch new" /> {t.memoryNew}
-                    <span className="swatch old" /> {t.memoryOld}
-                  </p>
-                  <ul>
-                    {facts.map((f) => (
-                      <li
-                        key={f.id}
-                        className={f.session_new ? 'fact-new' : 'fact-old'}
-                      >
-                        <span>{f.text}</span>
-                        {typeof f.certainty === 'number' && (
-                          <em>{f.certainty.toFixed(2)}</em>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                </>
+                <div className="memory-groups">
+                  {memoryGroups.map(([who, texts]) => (
+                    <section key={who} className="memory-group">
+                      <h3 className="memory-group-title">{who}</h3>
+                      <ul>
+                        {texts.map((text, i) => (
+                          <li key={`${who}-${i}`} className="fact-old">
+                            <span>{text}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  ))}
+                </div>
               )}
             </aside>
           )}

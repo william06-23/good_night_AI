@@ -2,9 +2,11 @@
 
 Use this document when continuing work on this repo. Prefer small, focused changes. Do not invent FastAPI/RAG layers unless asked. Model weights live under `models/` (gitignored) or `MIA_MODELS_DIR`. The Python venv is `.venv` at the repo root.
 
+Active feature branch for text-game work: **`AI_text_game`**.
+
 ## What this project is
 
-A local CLI girlfriend chat named **Mia**. One NVIDIA GPU runs a 4-bit Qwen chat model. Long-term memory is a JSON file of short facts with certainty scores. An embedding model (**bge-m3**, CPU) retrieves which facts to inject each turn. After the user says good night, Mia replies once, then a consolidation pass cleans the JSON.
+A local chat with **Mia**. One NVIDIA GPU runs Qwen (7B 4-bit or 14B GGUF). Long-term memory is **multi-perspective**: a JSON dict of character/role keys to string lists. On each user-initiated turn, an importance gate runs once; if important, three POV rewriters fill **Narrator** (objective), **Player** (user POV), and the **interlocutor** (e.g. Mia). **bge-m3** (CPU) retrieves from those three buckets into the reply prompt. After good night, Mia replies once, then organize cleans each key that had session-new strings.
 
 ## External dependencies (not committed)
 
@@ -44,110 +46,87 @@ Marks `mia_chat` as a package. Nearly empty.
 
 ### `mia_chat/chat_cli.py`
 
-**Main entrypoint.** Responsibilities:
+Thin CLI over `MiaEngine`.
 
-- Load Qwen 4-bit once (`MODEL_ID`).
-- Load `MemoryRetriever` (bge-m3 on CPU) and `long_term_memory.json`.
-- Interactive stdin loop.
-- **Short-term memory:** in-RAM `history` list of `{role, content}`; forgotten when the process exits. Trimmed by `trim_history_to_budget` for the prompt token cap (`MAX_PROMPT_TOKENS`).
-- Each turn:
-  1. Retrieve top facts for the user text (`MemoryRetriever.retrieve`).
-  2. Build system prompt = Mia persona + only those recalled facts.
-  3. Generate Mia’s reply on GPU.
-  4. If user text is an exit phrase (`good night`, `night night`, `晚安`, `exit`): print Mia’s reply, then call `organize_memory`, rebuild retriever, exit. **Do not** run `extract_and_store` on the goodbye turn.
-  5. Otherwise call `extract_and_store(...)` with `recalled_hits` for certainty context.
-- Persona: `MIA_SYSTEM_PROMPT` (Chinese girlfriend persona; gentle confusion if user contradicts recalled memory).
+### `mia_chat/engine.py`
 
-When editing chat behavior, start here. When editing memory logic, edit `memory.py` and only wire from here.
+Shared engine for CLI and FastAPI. Loads Qwen + bge-m3. `active_character` defaults to `Mia`. Each chat turn:
+
+1. `retrieve_for_turn` from Narrator + Player + active character.
+2. Build system prompt = Mia persona + labeled recalled memories.
+3. Generate reply; log transcript.
+4. Exit phrase → `organize_memory`, rebuild retriever, end.
+5. Else → `extract_and_store(..., character=active)` (triple write).
 
 ### `mia_chat/memory.py`
 
-**All long-term memory logic.** Key pieces:
+**All long-term memory logic.**
 
 | Symbol | Role |
 |--------|------|
+| `NARRATOR_KEY` / `PLAYER_KEY` | Fixed keys `"Narrator"` / `"Player"` |
+| `SPEAKABLE_CHARACTERS` / `DEFAULT_CHARACTER` | NPC roster; starts with `"Mia"` |
 | `MEMORY_PATH` | `mia_chat/data/long_term_memory.json` |
-| `EMBED_MODEL_ID` / `EMBED_DEVICE` | bge-m3 path; keep `"cpu"` so VRAM stays with Qwen |
-| `RETRIEVE_TOP_K` / `RETRIEVE_MIN_SCORE` | Recall up to 5 facts if score ≥ 0.25 |
-| `MAX_FACTS_PER_TURN` | Extract at most 5 facts from one user turn |
-| `NEAR_DUP_MIN` | Embedding threshold to bump existing fact instead of insert |
-| `MemoryRetriever` | Encode/index facts; `retrieve`, `best_match`, `rebuild`, `add_fact_embedding` |
-| `load_memory` / `save_memory` | JSON I/O; missing fields normalized (`certainty`, `session_new`, `updated_at`) |
-| `format_facts_for_prompt` | Bullet list for system prompt (includes certainty) |
-| `is_important` | Qwen gate: worth remembering? |
-| `summarize_facts` | Qwen rewrite → `{"facts": ["...", ...]}` (one idea per string) |
-| `score_introduction` / `score_context_match` / `compute_certainty` | Certainty for new facts |
-| `bump_certainty` | User re-hints same fact → raise certainty |
-| `extract_and_store` | Full pipeline for one non-exit turn |
-| `organize_memory` | Post–good-night consolidation |
+| `SESSION_NEW_KEY` | In-RAM `_session_new`; stripped on save |
+| `load_memory` / `save_memory` / `public_memory_store` | JSON I/O; legacy `facts` → Narrator texts |
+| `MemoryRetriever` | Index all string memories; `retrieve`, `retrieve_for_turn`, `best_match` |
+| `extract_and_store` | One gate → three POV rewrites → append strings |
+| `organize_memory` | Per-key same/contradict cleanup; keep earlier list entry |
+| `format_facts_for_prompt` | Labeled `【Narrator】` / `【Player】` / `【Mia】` blocks |
 
-**Extraction pipeline (one user turn = one `input()`, not “one line of text”):**
-
-1. Gate: important? If no → stop.
-2. Rewrite: up to 5 **independent** atomic facts (not split by newlines).
-3. For each fact separately: exact-string match or very-high embedding match → bump; else insert with certainty. Sibling facts from the **same turn** must not merge into each other (`skip_ids`).
-
-**Certainty (new facts start relatively low):**
-
-`certainty ≈ 0.12 + 0.40 * intro + 0.35 * context` (clamped ~0.05–0.85).  
-`intro` = how assertively the user stated it (Qwen).  
-`context` = similarity of the fact to this turn’s recalled long-term hits (embeddings).
-
-**Organize (after Mia’s last goodbye message):**
-
-- Only facts with `session_new: true` vs other facts.
-- Embedding candidates, then Qwen classifies `same` | `contradict` | `unrelated`.
-- `same` or `contradict`: keep higher certainty, delete the other. Preferable preferences that can both be true → `unrelated` (e.g. likes blue and likes yellow).
-- Clear all `session_new` flags; save JSON; caller rebuilds retriever.
-
-Qwen helper calls use greedy `generate` + strict JSON prompts (`GATE_SYSTEM`, `REWRITE_SYSTEM`, `INTRO_SYSTEM`, `ORGANIZE_SYSTEM`).
-
-### `mia_chat/chat_log.py`
-
-Append-only **user transcript** (`mia_chat/data/chat_log.jsonl`). Saves raw You/Mia lines for the human to read. **Not** used for retrieval, gating, or facts. Gitignored.
-
-### `mia_chat/data/long_term_memory.json`
-
-Persistent long-term store. Shape:
+**Storage shape:**
 
 ```json
 {
-  "facts": [
-    {
-      "id": "uuid",
-      "text": "short factual sentence",
-      "certainty": 0.0,
-      "created_at": "ISO-8601",
-      "updated_at": "ISO-8601",
-      "source": "chat",
-      "session_new": false
-    }
-  ]
+  "Narrator": ["objective fact…"],
+  "Player": ["from my point of view…"],
+  "Mia": ["from Mia's point of view…"]
 }
 ```
 
-Deleting a fact = remove its object from `facts` and save (or let `organize_memory` drop it). Empty `facts: []` is valid (fresh start).
+Values are plain strings only (no certainty / UUID / timestamps on disk).
+
+**User-initiated turn write path:**
+
+1. Gate: important? If no → stop all three.
+2. Rewrite Narrator (objective), Player (user POV), interlocutor (NPC POV).
+3. For each string: exact or near-dup within that key → skip; else append and mark session-new.
+
+**Recall path:** merge top hits from Narrator + Player + active character into the system prompt.
+
+**Organize (after goodbye):** for each key with session-new texts, compare vs peers in that key; `same`/`contradict` → drop the later list entry; clear session-new; save.
+
+### `mia_chat/api.py`
+
+- `GET /api/health` — includes `facts_count`, `characters`, `active_character`
+- `GET /api/memory` — full character→string[] dict
+- `GET /api/characters` — speakable roster + active
+- `POST /api/chat` — body `{ message, character? }`
+
+### `mia_chat/chat_log.py`
+
+Append-only user transcript (`mia_chat/data/chat_log.jsonl`). Not used for retrieval or facts. Gitignored.
 
 ### `mia_chat/_download_bge_m3.py`
 
-One-shot Hugging Face download of `BAAI/bge-m3` into `EMBED_MODEL_ID`’s folder. Not needed at runtime once weights exist.
+One-shot download of `BAAI/bge-m3` into `models/bge-m3` (or `MIA_MODELS_DIR`).
 
 ---
 
-## Runtime flow (mermaid)
+## Runtime flow
 
 ```mermaid
 flowchart TD
-  start[Start CLI] --> loadEmbed[Load bge-m3 on CPU]
-  loadEmbed --> loadJSON[Load long_term_memory.json]
-  loadJSON --> loadQwen[Load Qwen 4bit on GPU]
-  loadQwen --> loop[User input]
-  loop --> recall[Retrieve top facts CPU]
-  recall --> gen[Generate Mia reply GPU]
+  start[Start] --> loadEmbed[Load bge-m3 on CPU]
+  loadEmbed --> loadJSON[Load multi-perspective JSON]
+  loadJSON --> loadQwen[Load Qwen on GPU]
+  loadQwen --> loop[User message to chosen character]
+  loop --> recall[Retrieve Narrator plus Player plus NPC]
+  recall --> gen[Generate reply]
   gen --> exitCheck{Exit phrase?}
-  exitCheck -->|yes| organize[organize_memory]
+  exitCheck -->|yes| organize[organize per key]
   organize --> endNode[Exit]
-  exitCheck -->|no| extract[extract_and_store up to 5 facts]
+  exitCheck -->|no| extract[Triple POV extract_and_store]
   extract --> loop
 ```
 
@@ -155,18 +134,20 @@ flowchart TD
 
 ## Rules for agents editing this project
 
-1. Keep large weights under `models/` (gitignored) or `MIA_MODELS_DIR`; do not commit them. Prefer relative/`MODELS_DIR` paths over machine-specific absolutes.
+1. Keep large weights under `models/` (gitignored) or `MIA_MODELS_DIR`; do not commit them.
 2. Keep **chat on GPU**, **bge-m3 on CPU** unless the user asks otherwise.
 3. Short-term chat history stays in RAM only; do not log full transcripts unless asked.
 4. Exit phrases: Mia speaks first, **then** organize — never organize before the last reply.
-5. One user turn → one importance gate → many facts (max 5); facts are semantic units, not text lines.
-6. Prefer extending `memory.py` for memory features; keep `chat_cli.py` as the thin loop.
-7. JSON is enough for now; do not migrate to SQLite unless requested.
-8. Match existing style: Chinese prompts for Mia/gates, English comments OK.
+5. User-initiated turns write **exactly three** buckets: Narrator, Player, interlocutor.
+6. Prefer extending `memory.py` for memory features; keep `engine.py` as the thin orchestrator.
+7. JSON dict-of-lists is enough; do not migrate to SQLite unless requested.
+8. Do not reintroduce per-fact certainty objects unless the user asks.
+9. Match existing style: Chinese prompts for Mia/gates, English comments OK.
+10. Character-picker UI and NPC-initiated convos are deferred unless requested.
 
 ## Quick test checklist
 
 - Start chat; trivial hi → `[memory] not important` or no save.
-- “我叫X，住在Y” → `[memory] extracted 2 separate fact(s)` and two JSON rows with `certainty` / `session_new: true`.
-- Contradict a recalled fact → Mia shows mild confusion.
-- Say `晚安` → Mia replies → `[organize]…` → duplicates/contradictions with lower certainty removed.
+- Assert a preference → Narrator, Player, and Mia each may gain string(s); UI groups by key.
+- Contradict a recalled fact → Mia shows mild confusion when relevant memories are injected.
+- Say `晚安` → Mia replies → `[organize]…` → same/contradict cleaned within each key.
