@@ -4,7 +4,7 @@ Local chat with Mia, a cold university stranger you can try to get closer to. Sh
 
 Affection, dating, a possible boyfriend, and a fixed campus week are on this branch. `master` is the earlier girlfriend chat without that system.
 
-This folder is the program. It does **not** include the model weights or the Python environment.
+This folder is the program. Model weights go in a local `models/` folder (gitignored). The Python env is `.venv` at the repo root.
 
 ## What another machine needs
 
@@ -24,29 +24,27 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install transformers accelerate bitsandbytes sentence-transformers huggingface_hub fastapi uvicorn llama-cpp-python
 ```
 
-Use the CUDA wheel that matches the GPU driver. `cu124` is the index used on the original machine. The 14B path also needs the CUDA 12 runtime DLLs next to `llama.dll` (`llama_cpp_cudart12` on the original machine). `run_api.bat` puts that folder on `PATH`.
+Use the CUDA wheel that matches the GPU driver. `cu124` is a common CUDA 12 index. The 14B path also needs the CUDA 12 runtime DLLs in `models/llama_cpp_cudart12`. `run_api.bat` and `run_mia.bat` put that folder on `PATH`.
 
 In `web/`, run `npm install` once.
 
 ## Model weights
 
-Not bundled in this repo.
+Not bundled in this repo. Put them under `models/` next to the launchers:
 
-| Role | Runs on | Original path |
-|------|---------|---------------|
-| Chat, Qwen 2.5 7B 4-bit | GPU | `C:\Users\William\William's_AI_project\Qwen2.5-7B-Instruct-bnb-4bit` |
-| Chat, Qwen 2.5 14B GGUF Q4_K_M | GPU + RAM | `C:\Users\William\William's_AI_project\Qwen2.5-14B-Instruct-GGUF\Qwen2.5-14B-Instruct-Q4_K_M.gguf` |
-| Memory retrieval (`BAAI/bge-m3`) | CPU | `C:\Users\William\William's_AI_project\bge-m3` |
+| Role | Runs on | Default path |
+|------|---------|--------------|
+| Chat, Qwen 2.5 7B 4-bit | GPU | `models/Qwen2.5-7B-Instruct-bnb-4bit` |
+| Chat, Qwen 2.5 14B GGUF Q4_K_M | GPU + RAM | `models/Qwen2.5-14B-Instruct-GGUF/Qwen2.5-14B-Instruct-Q4_K_M.gguf` |
+| Memory retrieval (`BAAI/bge-m3`) | CPU | `models/bge-m3` |
+| llama-cpp CUDA 12 DLLs | — | `models/llama_cpp_cudart12` |
 
 Downloads if you are not copying folders:
 
 - 7B: `unsloth/Qwen2.5-7B-Instruct-bnb-4bit`
-- Retriever: `BAAI/bge-m3` (or `mia_chat/_download_bge_m3.py` after editing its `DEST` path)
+- Retriever: `BAAI/bge-m3` (or run `python -m mia_chat._download_bge_m3`)
 
-Then set paths in:
-
-- `CHAT_MODELS` in `mia_chat/engine.py` (7B folder, 14B `.gguf` file, and `LLAMA_CUDART_DIR`)
-- `EMBED_MODEL_ID` in `mia_chat/memory.py` (keep `EMBED_DEVICE` as `"cpu"` so Qwen keeps the GPU)
+To use weights somewhere else, set `MIA_MODELS_DIR` to that folder (same layout as `models/` above).
 
 ## How to run
 
@@ -71,11 +69,11 @@ Settings has the UI language and an affection speed slider from **0.8** to **1.5
 
 ### CLI
 
-Edit the `python.exe` path in `run_mia.bat`, then double-click it, or:
+Create `.venv` as above, then double-click **`run_mia.bat`**, or:
 
 ```bat
 set PYTHONPATH=%CD%
-"path\to\your\venv\Scripts\python.exe" -m mia_chat.chat_cli
+.venv\Scripts\python.exe -m mia_chat.chat_cli
 ```
 
 ## API

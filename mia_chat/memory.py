@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -19,7 +20,9 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 MEMORY_PATH = DATA_DIR / "long_term_memory.json"
 
 # Embedding retriever — keep on CPU so Qwen can own the GPU VRAM.
-EMBED_MODEL_ID = r"C:\Users\William\William's_AI_project\bge-m3"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MODELS_DIR = Path(os.environ.get("MIA_MODELS_DIR", _REPO_ROOT / "models")).expanduser()
+EMBED_MODEL_ID = str(_MODELS_DIR / "bge-m3")
 EMBED_DEVICE = "cpu"
 RETRIEVE_TOP_K = 5
 RETRIEVE_MIN_SCORE = 0.25

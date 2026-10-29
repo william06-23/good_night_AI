@@ -1,6 +1,6 @@
 # Good Night AI — agent context
 
-Use this document when continuing work on this repo. Prefer small, focused changes. Do not invent extra services unless asked. Models and the Python venv live **outside** this folder.
+Use this document when continuing work on this repo. Prefer small, focused changes. Do not invent extra services unless asked. Model weights live under `models/` (gitignored) or `MIA_MODELS_DIR`. The Python venv is `.venv` at the repo root.
 
 Current branch for the dating sim is **Rizz-the-AI**. `master` is the earlier girlfriend CLI.
 
@@ -10,15 +10,17 @@ A local chat with **Mia**, a cold university stranger. One NVIDIA GPU runs Qwen 
 
 The usual way to run it is the web UI: `run_web.bat` (API on port 8000, Vite on 5173). `run_mia.bat` still starts the CLI.
 
-## External dependencies (not in this repo)
+## External dependencies (not committed)
 
-| Asset | Typical path on the author’s machine | Device |
-|-------|--------------------------------------|--------|
-| Chat model `Qwen2.5-7B-Instruct-bnb-4bit` | `C:\Users\William\William's_AI_project\Qwen2.5-7B-Instruct-bnb-4bit` | GPU (`device_map="auto"`) |
-| Chat model `Qwen2.5-14B-Instruct-Q4_K_M.gguf` | `C:\Users\William\William's_AI_project\Qwen2.5-14B-Instruct-GGUF\` | GPU layers + RAM (`llama-cpp-python`) |
-| CUDA 12 runtime for the GGUF wheel | `C:\Users\William\William's_AI_project\llama_cpp_cudart12` | — |
-| Retriever `BAAI/bge-m3` | `C:\Users\William\William's_AI_project\bge-m3` | CPU |
-| Python env | `C:\Users\William\William's_AI_project\torch_env` | — |
+| Asset | Default path | Device |
+|-------|--------------|--------|
+| Chat model `Qwen2.5-7B-Instruct-bnb-4bit` | `models/Qwen2.5-7B-Instruct-bnb-4bit` | GPU (`device_map="auto"`) |
+| Chat model 14B GGUF | `models/Qwen2.5-14B-Instruct-GGUF/Qwen2.5-14B-Instruct-Q4_K_M.gguf` | GPU + RAM |
+| CUDA 12 runtime for the GGUF wheel | `models/llama_cpp_cudart12` | — |
+| Retriever `BAAI/bge-m3` | `models/bge-m3` | CPU |
+| Python env | `.venv` | — |
+
+Override the models root with env `MIA_MODELS_DIR` (same folder layout as `models/`).
 
 Packages: `torch` (CUDA), `transformers`, `accelerate`, `bitsandbytes`, `sentence-transformers`, `llama-cpp-python`, `fastapi`, `uvicorn`.
 
@@ -115,7 +117,7 @@ flowchart TD
 
 ## Rules for agents editing this project
 
-1. Do not put model weights inside this repo; only update path constants.
+1. Keep large weights under `models/` (gitignored) or `MIA_MODELS_DIR`; do not commit them. Prefer relative/`MODELS_DIR` paths over machine-specific absolutes.
 2. Keep chat on the GPU and bge-m3 on the CPU unless the user asks otherwise.
 3. Short-term history stays in RAM. The JSONL transcript is for the human and for absence timing.
 4. On good night, Mia speaks first, then organize. Do not organize before that reply.
