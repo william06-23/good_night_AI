@@ -24,23 +24,28 @@ from .memory import (
     organize_memory,
 )
 
+# Weights live under models/ (or MIA_MODELS_DIR). Not committed to git.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MODELS_DIR = Path(os.environ.get("MIA_MODELS_DIR", REPO_ROOT / "models")).expanduser()
+
 # CUDA 12 runtime DLLs required by the llama-cpp-python Windows CUDA wheel.
-LLAMA_CUDART_DIR = Path(r"C:\Users\William\William's_AI_project\llama_cpp_cudart12")
+LLAMA_CUDART_DIR = MODELS_DIR / "llama_cpp_cudart12"
 
 CHAT_MODELS = {
     "7b": {
         "label": "Qwen 2.5 7B",
         "note": "Fits this laptop easily",
         "backend": "transformers",
-        "path": r"C:\Users\William\William's_AI_project\Qwen2.5-7B-Instruct-bnb-4bit",
+        "path": str(MODELS_DIR / "Qwen2.5-7B-Instruct-bnb-4bit"),
     },
     "14b": {
         "label": "Qwen 2.5 14B",
         "note": "GGUF; most layers on GPU, rest in RAM",
         "backend": "gguf",
-        "path": (
-            r"C:\Users\William\William's_AI_project"
-            r"\Qwen2.5-14B-Instruct-GGUF\Qwen2.5-14B-Instruct-Q4_K_M.gguf"
+        "path": str(
+            MODELS_DIR
+            / "Qwen2.5-14B-Instruct-GGUF"
+            / "Qwen2.5-14B-Instruct-Q4_K_M.gguf"
         ),
         # Leave VRAM headroom for KV cache; full 48-layer offload thrashes 8 GB cards.
         "n_gpu_layers": 32,

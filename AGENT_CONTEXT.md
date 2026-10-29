@@ -1,22 +1,26 @@
 # Good Night AI — agent context
 
-Use this document when continuing work on this repo. Prefer small, focused changes. Do not invent FastAPI/RAG layers unless asked. Models and the Python venv live **outside** this folder.
+Use this document when continuing work on this repo. Prefer small, focused changes. Do not invent FastAPI/RAG layers unless asked. Model weights live under `models/` (gitignored) or `MIA_MODELS_DIR`. The Python venv is `.venv` at the repo root.
 
 ## What this project is
 
 A local CLI girlfriend chat named **Mia**. One NVIDIA GPU runs a 4-bit Qwen chat model. Long-term memory is a JSON file of short facts with certainty scores. An embedding model (**bge-m3**, CPU) retrieves which facts to inject each turn. After the user says good night, Mia replies once, then a consolidation pass cleans the JSON.
 
-## External dependencies (not in this repo)
+## External dependencies (not committed)
 
-| Asset | Typical path on the author’s machine | Device |
-|-------|--------------------------------------|--------|
-| Chat model `Qwen2.5-7B-Instruct-bnb-4bit` | `C:\Users\William\William's_AI_project\Qwen2.5-7B-Instruct-bnb-4bit` | GPU (`device_map="auto"`) |
-| Retriever `BAAI/bge-m3` | `C:\Users\William\William's_AI_project\bge-m3` | CPU |
-| Python env | `C:\Users\William\William's_AI_project\torch_env` | — |
+| Asset | Default path | Device |
+|-------|--------------|--------|
+| Chat model `Qwen2.5-7B-Instruct-bnb-4bit` | `models/Qwen2.5-7B-Instruct-bnb-4bit` | GPU (`device_map="auto"`) |
+| Chat model 14B GGUF | `models/Qwen2.5-14B-Instruct-GGUF/Qwen2.5-14B-Instruct-Q4_K_M.gguf` | GPU + RAM |
+| Retriever `BAAI/bge-m3` | `models/bge-m3` | CPU |
+| llama-cpp CUDA 12 DLLs | `models/llama_cpp_cudart12` | — |
+| Python env | `.venv` | — |
 
-Packages: `torch` (CUDA), `transformers`, `accelerate`, `bitsandbytes`, `sentence-transformers`, `huggingface_hub`.
+Override the models root with env `MIA_MODELS_DIR` (same folder layout as `models/`).
 
-Run: double-click `run_mia.bat`, or with venv active: `python mia_chat\chat_cli.py`.
+Packages: `torch` (CUDA), `transformers`, `accelerate`, `bitsandbytes`, `sentence-transformers`, `huggingface_hub`, `fastapi`, `uvicorn`, `llama-cpp-python`.
+
+Run: double-click `run_mia.bat` / `run_web.bat`, or with venv active: `python -m mia_chat.chat_cli`.
 
 ---
 
@@ -24,7 +28,7 @@ Run: double-click `run_mia.bat`, or with venv active: `python mia_chat\chat_cli.
 
 ### `run_mia.bat`
 
-Launcher. `cd`s to the repo root and runs `torch_env\Scripts\python.exe mia_chat\chat_cli.py`. On another machine, edit the Python path. If the script errors, `pause` keeps the window open.
+Launcher. `cd`s to the repo root, puts `models\llama_cpp_cudart12` on `PATH`, and runs `.venv\Scripts\python.exe -m mia_chat.chat_cli`. If the script errors, `pause` keeps the window open.
 
 ### `README.md`
 
@@ -151,7 +155,7 @@ flowchart TD
 
 ## Rules for agents editing this project
 
-1. **Do not** put large model weights inside `Good_night_AI`; only update path constants.
+1. Keep large weights under `models/` (gitignored) or `MIA_MODELS_DIR`; do not commit them. Prefer relative/`MODELS_DIR` paths over machine-specific absolutes.
 2. Keep **chat on GPU**, **bge-m3 on CPU** unless the user asks otherwise.
 3. Short-term chat history stays in RAM only; do not log full transcripts unless asked.
 4. Exit phrases: Mia speaks first, **then** organize — never organize before the last reply.
