@@ -6,7 +6,7 @@ Active feature branch for text-game work: **`AI_text_game`**.
 
 ## What this project is
 
-A local chat with **Mia**. One NVIDIA GPU runs Qwen (7B 4-bit or 14B GGUF). Long-term memory is **multi-perspective**: a JSON dict of character/role keys to string lists. On each user-initiated turn, an importance gate runs once; if important, three POV rewriters fill **Narrator** (objective), **Player** (user POV), and the **interlocutor** (e.g. Mia). **bge-m3** (CPU) retrieves from those three buckets into the reply prompt. After good night, Mia replies once, then organize cleans each key that had session-new strings.
+On **`AI_text_game`**: a **directed text adventure**. One GPU Qwen (7B/14B) plays story generator, narrator/director, and all NPC voices via different prompts. **bge-m3** (CPU) retrieves multi-perspective memories (`Narrator` / `Player` / per-NPC string lists). Cast template: competitor + goal person + 2–3 supporting. Up to **5 scenes**, ~**15** lines soft-cap per scene. Every dialogue line has addressees (`to[]`): player picks via checkboxes; narrator cue sets NPC targets. Web test UI: [`web/src/StoryApp.jsx`](web/src/StoryApp.jsx).
 
 ## External dependencies (not committed)
 
@@ -96,12 +96,22 @@ Values are plain strings only (no certainty / UUID / timestamps on disk).
 
 **Organize (after goodbye):** for each key with session-new texts, compare vs peers in that key; `same`/`contradict` → drop the later list entry; clear session-new; save.
 
+### `mia_chat/story.py`
+
+Story setup JSON, narrator intro/bridge/cue, character-line prompts, `StoryState`, `lookup_character` (dict + for-loop name match).
+
 ### `mia_chat/api.py`
 
-- `GET /api/health` — includes `facts_count`, `characters`, `active_character`
-- `GET /api/memory` — full character→string[] dict
+- `GET /api/health` — includes `mode`, `story`, roster
+- `GET /api/memory` — character→string[] dict
 - `GET /api/characters` — speakable roster + active
-- `POST /api/chat` — body `{ message, character? }`
+- `POST /api/story/generate` — `{ theme? }`
+- `POST /api/story/intro` / `POST /api/story/advance`
+- `POST /api/chat` — story mode: `{ message, to: string[] }`
+
+### `web/src/StoryApp.jsx`
+
+Simple test UI: pick model → generate story → start scene → advance cues → player interrupt with checkboxes.
 
 ### `mia_chat/chat_log.py`
 
@@ -143,11 +153,10 @@ flowchart TD
 7. JSON dict-of-lists is enough; do not migrate to SQLite unless requested.
 8. Do not reintroduce per-fact certainty objects unless the user asks.
 9. Match existing style: Chinese prompts for Mia/gates, English comments OK.
-10. Character-picker UI and NPC-initiated convos are deferred unless requested.
+10. Do not push story work to `master`; stay on `AI_text_game`.
 
-## Quick test checklist
+## Quick test checklist (StoryApp)
 
-- Start chat; trivial hi → `[memory] not important` or no save.
-- Assert a preference → Narrator, Player, and Mia each may gain string(s); UI groups by key.
-- Contradict a recalled fact → Mia shows mild confusion when relevant memories are injected.
-- Say `晚安` → Mia replies → `[organize]…` → same/contradict cleaned within each key.
+- `run_web.bat` → pick 7B/14B → Generate story → Start scene 1 → read narrator + first cue.
+- Advance → NPC or wait-for-player; checkbox at least one cast member → Send interrupt.
+- After ~15 lines or narrator `end_scene`, bridge to next scene; after scene 5, story complete.

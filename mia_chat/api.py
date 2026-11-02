@@ -1,10 +1,5 @@
 """
-FastAPI server for Mia — load models once, chat via HTTP.
-
-Run from repo root:
-  python -m uvicorn mia_chat.api:app --host 127.0.0.1 --port 8000
-
-Or from mia_chat/ with PYTHONPATH=..
+FastAPI server for Mia / text-game — load models once, chat + story via HTTP.
 """
 
 from __future__ import annotations
@@ -30,7 +25,7 @@ async def lifespan(app: FastAPI):
     print("Mia API shutting down.")
 
 
-app = FastAPI(title="Good Night AI — Mia", lifespan=lifespan)
+app = FastAPI(title="Good Night AI — Text Game", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -48,19 +43,27 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
     character: str | None = None
+    to: list[str] | None = None
 
 
 class ModelChoice(BaseModel):
     key: str = Field(..., min_length=1)
 
 
+class ThemeBody(BaseModel):
+    theme: str | None = None
+
+
 class ChatResponse(BaseModel):
-    reply: str
-    recalled: list[dict[str, Any]]
-    ended: bool
-    facts_count: int
-    session_id: str
-    character: str
+    reply: str = ""
+    recalled: list[dict[str, Any]] = Field(default_factory=list)
+    ended: bool = False
+    facts_count: int = 0
+    session_id: str = ""
+    character: str = ""
+    to: list[str] = Field(default_factory=list)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    story: dict[str, Any] | None = None
 
 
 @app.get("/api/health")
@@ -87,7 +90,6 @@ def retry_model() -> dict[str, Any]:
 
 @app.get("/api/memory")
 def get_memory() -> dict[str, Any]:
-    """Character-keyed string lists (Narrator / Player / NPCs)."""
     store = engine.get_memory()
     public = public_memory_store(store)
     if any(public.values()):
@@ -103,9 +105,47 @@ def get_characters() -> dict[str, Any]:
     }
 
 
+@app.get("/api/story")
+def get_story() -> dict[str, Any]:
+    return {
+        "story": engine.story.public_dict() if engine.story else None,
+        "status": engine.status(),
+    }
+
+
+@app.post("/api/story/generate")
+def story_generate(body: ThemeBody | None = None) -> dict[str, Any]:
+    if not engine.ready:
+        raise HTTPException(503, "Engine not ready — still loading?")
+    theme = body.theme if body else None
+    try:
+        return engine.generate_story(theme=theme)
+    except Exception as e:
+        raise HTTPException(500, str(e)) from e
+
+
+@app.post("/api/story/intro")
+def story_intro() -> dict[str, Any]:
+    if not engine.ready:
+        raise HTTPException(503, "Engine not ready")
+    try:
+        return engine.start_intro()
+    except Exception as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/story/advance")
+def story_advance() -> dict[str, Any]:
+    if not engine.ready:
+        raise HTTPException(503, "Engine not ready")
+    try:
+        return engine.advance_scene()
+    except Exception as e:
+        raise HTTPException(400, str(e)) from e
+
+
 @app.get("/api/chat/history")
 def chat_history() -> dict[str, Any]:
-    """Past transcript for the UI only — not fed back into the model."""
     return {"messages": load_messages()}
 
 
@@ -114,12 +154,22 @@ def chat(body: ChatRequest) -> ChatResponse:
     if not engine.ready:
         raise HTTPException(503, "Engine not ready — still loading?")
     try:
-        result = engine.chat(body.message, character=body.character)
+        result = engine.chat(body.message, character=body.character, to=body.to)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
-    return ChatResponse(**result)
+    return ChatResponse(
+        reply=result.get("reply") or "",
+        recalled=result.get("recalled") or [],
+        ended=bool(result.get("ended")),
+        facts_count=int(result.get("facts_count") or 0),
+        session_id=result.get("session_id") or "",
+        character=result.get("character") or "",
+        to=result.get("to") or [],
+        events=result.get("events") or [],
+        story=result.get("story"),
+    )
 
 
 @app.post("/api/session/reset")

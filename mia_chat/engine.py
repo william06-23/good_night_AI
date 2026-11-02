@@ -18,14 +18,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from .chat_log import log_turn, new_session_id, start_session
 from .memory import (
     DEFAULT_CHARACTER,
+    NARRATOR_KEY,
+    PLAYER_KEY,
     MemoryRetriever,
+    add_memory,
     count_memories,
+    ensure_character,
     extract_and_store,
     format_facts_for_prompt,
     is_speakable,
     list_speakable_characters,
     load_memory,
     organize_memory,
+    save_memory,
+    set_speakable_characters,
+)
+from .story import (
+    StoryState,
+    append_log,
+    clamp_addressees,
+    generate_character_line,
+    generate_story_setup,
+    lookup_character,
+    narrator_bridge,
+    narrator_cue,
+    narrator_intro,
 )
 
 # Weights live under models/ (or MIA_MODELS_DIR). Not committed to git.
@@ -109,6 +126,8 @@ class MiaEngine:
         self.model_key: str | None = None
         self.load_error: str | None = None
         self._lock = threading.Lock()
+        self.story: StoryState | None = None
+        self.mode: str = "chat"  # chat | story
 
     def list_models(self) -> list[dict]:
         return [
@@ -237,7 +256,7 @@ class MiaEngine:
             start_session(self.session_id)
 
     def status(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "ready": self.ready,
             "phase": self.phase,
             "model_key": self.model_key,
@@ -249,7 +268,10 @@ class MiaEngine:
             "active_character": self.active_character,
             "characters": list_speakable_characters(),
             "history_turns": len(self.history),
+            "mode": self.mode,
+            "story": self.story.public_dict() if self.story else None,
         }
+        return out
 
     def get_memory(self) -> dict:
         return self.memory_store
@@ -322,13 +344,19 @@ class MiaEngine:
         new_tokens = output_ids[0][inputs["input_ids"].shape[-1] :]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-    def chat(self, user_text: str, character: str | None = None) -> dict[str, Any]:
+    def chat(
+        self,
+        user_text: str,
+        character: str | None = None,
+        to: list[str] | None = None,
+    ) -> dict[str, Any]:
         """
-        One turn: triple recall → reply → log → triple extract or organize.
+        Chat turn. In story mode this is a player interrupt with required to[].
+        Legacy girlfriend chat still works when mode != story.
         """
         if not self.ready:
             raise RuntimeError("Engine not loaded")
-        if self.ended:
+        if self.ended and self.mode != "story":
             raise RuntimeError("Session ended; call reset_session() first")
 
         user_text = (user_text or "").strip()
@@ -336,6 +364,9 @@ class MiaEngine:
             raise ValueError("Empty message")
 
         with self._lock:
+            if self.mode == "story" and self.story is not None:
+                return self._story_player_turn(user_text, to or [])
+
             if character is not None:
                 self.set_active_character(character)
             who = self.active_character
@@ -358,7 +389,6 @@ class MiaEngine:
                     )
                     self.retriever.rebuild(self.memory_store)
                 except Exception as e:
-                    # Never fail the goodbye reply because organize crashed.
                     print(f"[engine] organize_memory failed (kept reply): {e}")
                 self.ended = True
             else:
@@ -392,4 +422,313 @@ class MiaEngine:
                 "facts_count": count_memories(self.memory_store),
                 "session_id": self.session_id,
                 "character": who,
+                "events": [],
+                "story": None,
             }
+
+    # --- Story mode ---------------------------------------------------------
+
+    def _seed_story_memories(self, state: StoryState) -> None:
+        names = state.cast_names()
+        set_speakable_characters(names)
+        for name in names:
+            ensure_character(self.memory_store, name)
+        ensure_character(self.memory_store, NARRATOR_KEY)
+        ensure_character(self.memory_store, PLAYER_KEY)
+
+        seeds: list[tuple[str, str]] = [
+            (NARRATOR_KEY, f"故事背景：{state.background[:400]}"),
+            (
+                PLAYER_KEY,
+                f"我是{state.player.get('name')}，{state.player.get('identity')}。"
+                f"目标：{state.player.get('goal')}",
+            ),
+        ]
+        for card in state.character_dict.values():
+            seeds.append(
+                (
+                    card.name,
+                    f"{card.name}（{card.slot}）：{card.description} 性格：{card.persona}",
+                )
+            )
+        for who, text in seeds:
+            add_memory(self.memory_store, who, text)
+        save_memory(self.memory_store)
+        if self.retriever is not None:
+            self.retriever.rebuild(self.memory_store)
+        if names:
+            self.active_character = names[0]
+
+    def generate_story(self, theme: str | None = None) -> dict[str, Any]:
+        if not self.ready:
+            raise RuntimeError("Engine not loaded")
+        with self._lock:
+            state = generate_story_setup(self.model, self.tokenizer, theme=theme)
+            self._seed_story_memories(state)
+            self.story = state
+            self.mode = "story"
+            self.ended = False
+            self.waiting_cleared()
+            return {"story": state.public_dict(), "status": self.status()}
+
+    def waiting_cleared(self) -> None:
+        if self.story:
+            self.story.waiting_for_player = False
+
+    def start_intro(self) -> dict[str, Any]:
+        if not self.ready:
+            raise RuntimeError("Engine not loaded")
+        if self.story is None:
+            raise RuntimeError("Generate a story first")
+        with self._lock:
+            state = self.story
+            if state.story_complete:
+                raise RuntimeError("Story already complete")
+            text = narrator_intro(self.model, self.tokenizer, state)
+            state.current_narration = text
+            append_log(
+                state, speaker=NARRATOR_KEY, text=text, to=[], kind="narrator"
+            )
+            # First cue after intro
+            events = self._advance_once_unlocked(force_cue=True)
+            return {
+                "events": events,
+                "story": state.public_dict(),
+                "status": self.status(),
+            }
+
+    def advance_scene(self) -> dict[str, Any]:
+        if not self.ready:
+            raise RuntimeError("Engine not loaded")
+        if self.story is None:
+            raise RuntimeError("Generate a story first")
+        with self._lock:
+            if self.story.story_complete:
+                return {
+                    "events": [],
+                    "story": self.story.public_dict(),
+                    "status": self.status(),
+                }
+            if self.story.waiting_for_player:
+                return {
+                    "events": [],
+                    "story": self.story.public_dict(),
+                    "status": self.status(),
+                    "waiting_for_player": True,
+                }
+            events = self._advance_once_unlocked(force_cue=True)
+            return {
+                "events": events,
+                "story": self.story.public_dict(),
+                "status": self.status(),
+            }
+
+    def _maybe_end_scene_unlocked(self, cue_end: bool) -> list[dict[str, Any]]:
+        state = self.story
+        assert state is not None
+        events: list[dict[str, Any]] = []
+        hit_cap = state.message_count_in_scene >= state.scene_message_cap
+        if not (cue_end or hit_cap):
+            return events
+        if state.scene_index >= state.max_scenes:
+            state.story_complete = True
+            events.append(
+                {
+                    "type": "story_complete",
+                    "text": "故事结束（已达 5 幕上限）。",
+                }
+            )
+            return events
+        bridge = narrator_bridge(self.model, self.tokenizer, state)
+        state.current_narration = bridge
+        entry = append_log(
+            state, speaker=NARRATOR_KEY, text=bridge, to=[], kind="narrator"
+        )
+        events.append({"type": "narrator", **entry})
+        state.scene_index += 1
+        state.message_count_in_scene = 0
+        events.append(
+            {
+                "type": "scene_start",
+                "scene_index": state.scene_index,
+                "max_scenes": state.max_scenes,
+            }
+        )
+        return events
+
+    def _advance_once_unlocked(self, *, force_cue: bool = False) -> list[dict[str, Any]]:
+        _ = force_cue
+        state = self.story
+        assert state is not None
+        events: list[dict[str, Any]] = []
+
+        cue = narrator_cue(self.model, self.tokenizer, state)
+        events.append({"type": "cue", **cue})
+
+        # Scene end before speaking if narrator says so and there is already content
+        if cue.get("end_scene") and state.message_count_in_scene > 0:
+            events.extend(self._maybe_end_scene_unlocked(True))
+            if state.story_complete:
+                return events
+            # After bridge, cue again for the new scene
+            cue = narrator_cue(self.model, self.tokenizer, state)
+            events.append({"type": "cue", **cue})
+
+        speaker = str(cue.get("speaker") or PLAYER_KEY)
+        to = list(cue.get("to") or [])
+
+        if speaker == PLAYER_KEY:
+            state.waiting_for_player = True
+            state.suggested_to = [
+                n for n in to if n in state.cast_names()
+            ] or list(state.cast_names()[:1])
+            events.append(
+                {
+                    "type": "wait_player",
+                    "suggested_to": list(state.suggested_to),
+                    "reason": cue.get("reason"),
+                }
+            )
+            return events
+
+        if speaker == NARRATOR_KEY:
+            # Short narrator beat using intro-style context
+            text = narrator_intro(self.model, self.tokenizer, state)
+            state.current_narration = text
+            entry = append_log(
+                state, speaker=NARRATOR_KEY, text=text, to=[], kind="narrator"
+            )
+            events.append({"type": "narrator", **entry})
+            events.extend(
+                self._maybe_end_scene_unlocked(
+                    state.message_count_in_scene >= state.scene_message_cap
+                )
+            )
+            return events
+
+        card = lookup_character(state.character_dict, speaker)
+        if card is None:
+            # Fallback: wait for player
+            state.waiting_for_player = True
+            state.suggested_to = list(state.cast_names()[:1])
+            events.append(
+                {
+                    "type": "wait_player",
+                    "suggested_to": list(state.suggested_to),
+                    "reason": f"未知角色「{speaker}」，改由玩家行动",
+                }
+            )
+            return events
+
+        to = clamp_addressees(to, state)
+        query = state.current_narration or state.background[:200]
+        hits = []
+        if self.retriever is not None:
+            hits = self.retriever.retrieve_for_turn(query, card.name)
+        line = generate_character_line(
+            self.model,
+            self.tokenizer,
+            state,
+            card,
+            to,
+            recalled_hits=hits,
+        )
+        entry = append_log(
+            state, speaker=card.name, text=line, to=to, kind="dialogue"
+        )
+        self.active_character = card.name
+        events.append(
+            {
+                "type": "dialogue",
+                **entry,
+                "recalled": hits,
+            }
+        )
+        try:
+            extract_and_store(
+                self.model,
+                self.tokenizer,
+                self.memory_store,
+                f"（对 {', '.join(to)}）{line}",
+                "",
+                retriever=self.retriever,
+                recalled_hits=hits,
+                history=[],
+                character=card.name,
+            )
+        except Exception as e:
+            print(f"[engine] NPC memory extract failed: {e}")
+
+        # End scene after the line if soft-capped, or if cue requested end
+        # (and we did not already bridge at the top of this advance).
+        events.extend(
+            self._maybe_end_scene_unlocked(
+                state.message_count_in_scene >= state.scene_message_cap
+            )
+        )
+        if cue.get("end_scene") and not state.story_complete:
+            events.extend(self._maybe_end_scene_unlocked(True))
+        return events
+
+    def _story_player_turn(self, user_text: str, to: list[str]) -> dict[str, Any]:
+        state = self.story
+        assert state is not None
+        if state.story_complete:
+            raise RuntimeError("Story already complete")
+
+        addressees = clamp_addressees(to, state)
+        # Must address at least one NPC
+        npc_targets = [n for n in addressees if n in state.character_dict]
+        if not npc_targets:
+            raise ValueError("Select at least one character to speak to")
+
+        state.waiting_for_player = False
+        entry = append_log(
+            state,
+            speaker=PLAYER_KEY,
+            text=user_text,
+            to=npc_targets,
+            kind="dialogue",
+        )
+        log_turn(user_text, "", self.session_id)
+        self.history.append({"role": "user", "content": user_text})
+
+        for who in npc_targets:
+            try:
+                hits = (
+                    self.retriever.retrieve_for_turn(user_text, who)
+                    if self.retriever
+                    else []
+                )
+                extract_and_store(
+                    self.model,
+                    self.tokenizer,
+                    self.memory_store,
+                    user_text,
+                    "",
+                    retriever=self.retriever,
+                    recalled_hits=hits,
+                    history=self.history,
+                    character=who,
+                )
+            except Exception as e:
+                print(f"[engine] player memory extract failed for {who}: {e}")
+
+        self.active_character = npc_targets[0]
+        events: list[dict[str, Any]] = [{"type": "player", **entry}]
+        events.extend(
+            self._maybe_end_scene_unlocked(
+                state.message_count_in_scene >= state.scene_message_cap
+            )
+        )
+        return {
+            "reply": "",
+            "recalled": [],
+            "ended": state.story_complete,
+            "facts_count": count_memories(self.memory_store),
+            "session_id": self.session_id,
+            "character": self.active_character,
+            "to": npc_targets,
+            "events": events,
+            "story": state.public_dict(),
+        }

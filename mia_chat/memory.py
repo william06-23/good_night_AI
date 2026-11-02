@@ -96,6 +96,25 @@ def list_speakable_characters() -> list[str]:
     return list(SPEAKABLE_CHARACTERS)
 
 
+def set_speakable_characters(names: list[str]) -> list[str]:
+    """Replace the NPC roster (used after story generation)."""
+    global SPEAKABLE_CHARACTERS
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = (raw or "").strip()
+        if not name or name in (NARRATOR_KEY, PLAYER_KEY):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+    if not cleaned:
+        cleaned = [DEFAULT_CHARACTER]
+    SPEAKABLE_CHARACTERS = cleaned
+    return list(SPEAKABLE_CHARACTERS)
+
+
 def is_speakable(name: str) -> bool:
     return (name or "").strip() in SPEAKABLE_CHARACTERS
 

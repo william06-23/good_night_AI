@@ -1,0 +1,144 @@
+.story-app {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 1rem 1rem 3rem;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #1a1a1a;
+  background: linear-gradient(180deg, #f3efe6 0%, #e8e2d4 40%, #f7f4ee 100%);
+  min-height: 100vh;
+  box-sizing: border-box;
+}
+
+.story-header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  letter-spacing: 0.02em;
+}
+
+.story-header .meta {
+  margin: 0.25rem 0 0;
+  color: #666;
+  font-size: 0.85rem;
+}
+
+.panel {
+  margin-top: 1rem;
+  padding: 0.9rem 1rem;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid #d9d2c4;
+}
+
+.panel h2 {
+  margin: 0 0 0.6rem;
+  font-size: 0.95rem;
+}
+
+.row-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+button {
+  border: 1px solid #3d3a34;
+  background: #2c2a26;
+  color: #f5f0e6;
+  padding: 0.45rem 0.75rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.theme {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 0.5rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid #ccc;
+  background: #fff;
+}
+
+.setup .bg {
+  white-space: pre-wrap;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.cast {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.85rem;
+}
+
+.feed-panel .feed {
+  max-height: 420px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding-right: 0.25rem;
+}
+
+.line {
+  padding: 0.5rem 0.6rem;
+  font-size: 0.88rem;
+  line-height: 1.4;
+  border-left: 3px solid #bbb;
+  background: #faf8f4;
+}
+
+.line.narrator {
+  border-left-color: #8a6d3b;
+  font-style: italic;
+  color: #4a3b22;
+}
+
+.line.player {
+  border-left-color: #2f6f4e;
+  background: #eef6f1;
+}
+
+.line.npc {
+  border-left-color: #3b5f8a;
+  background: #eef3f8;
+}
+
+.line.cue,
+.line.system {
+  border-left-color: #999;
+  color: #555;
+  font-size: 0.8rem;
+  background: transparent;
+}
+
+.empty {
+  color: #888;
+  font-size: 0.85rem;
+}
+
+.composer textarea {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border: 1px solid #ccc;
+  resize: vertical;
+  font: inherit;
+}
+
+.checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.85rem;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+}

@@ -2,7 +2,7 @@
 
 Local chat with Mia, your girlfriend. Short-term chat stays in RAM for this session. Long-term memory is multi-perspective JSON in `mia_chat/data/long_term_memory.json` (`Narrator` / `Player` / NPC string lists). On each turn, `BAAI/bge-m3` (CPU) retrieves from those buckets and injects them into the prompt.
 
-You can run Qwen 2.5 **7B** (4-bit, transformers) or **14B** (GGUF, llama.cpp). The web UI asks you to pick one after the API is up. The dating-sim version lives on the `Rizz-the-AI` branch.
+You can run Qwen 2.5 **7B** (4-bit, transformers) or **14B** (GGUF, llama.cpp). On branch **`AI_text_game`**, the web UI (`StoryApp`) is a directed text-adventure test harness (generate story → narrator cues → talk with checkbox addressees). The dating-sim version lives on `Rizz-the-AI`; classic girlfriend chat on `master`.
 
 This folder is the chat program. Model weights go in a local `models/` folder (gitignored). The Python env is `.venv` at the repo root.
 
@@ -78,8 +78,9 @@ set PYTHONPATH=%CD%
 - `POST /api/model` and `POST /api/model/retry`
 - `GET /api/memory` (character → string lists)
 - `GET /api/characters`
+- `POST /api/story/generate`, `/api/story/intro`, `/api/story/advance`
 - `GET /api/chat/history`
-- `POST /api/chat` (optional `character`)
+- `POST /api/chat` (`to` list required in story mode)
 - `POST /api/session/reset`
 
 ## Private runtime files
