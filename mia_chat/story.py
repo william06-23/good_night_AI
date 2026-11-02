@@ -25,7 +25,10 @@ NARRATOR_MAX_NEW_TOKENS = 256
 CUE_MAX_NEW_TOKENS = 128
 CHARACTER_MAX_NEW_TOKENS = 256
 MAX_SCENES = 5
-SCENE_MESSAGE_CAP = 15
+SCENE_DIALOGUE_MIN = 8
+SCENE_DIALOGUE_MAX = 15
+# Legacy alias used in a few places
+SCENE_MESSAGE_CAP = SCENE_DIALOGUE_MAX
 
 STORY_GEN_SYSTEM = (
     "你是文字冒险开场编剧。只输出 JSON，不要 markdown。"
@@ -36,10 +39,19 @@ STORY_GEN_SYSTEM = (
     "competitor：与玩家目标相近或冲突的对手。"
     "goal_person：与玩家目标直接相关的人（如对象、目标人物等）。"
     "supporting：制造障碍或互动的配角。"
-    "每个人物给 description（剧情角色）和 persona（说话性格口吻，一两句）。"
+    "每个人物给 description（剧情中的身份/作用，一两句即可；详细性格稍后另生成）。"
+    "persona 字段可先填空字符串。"
     '严格格式：{"background":"...","player":{"name":"...","identity":"...","goal":"..."},'
     '"characters":[{"name":"...","slot":"competitor|goal_person|supporting",'
-    '"description":"...","persona":"..."}]}'
+    '"description":"...","persona":""}]}'
+)
+
+PERSONA_GEN_SYSTEM = (
+    "你是角色人设设计师。根据故事背景与该角色的剧情身份（slot+description），"
+    "用中文生成详细人设，只输出 JSON。"
+    "要具体、可表演，包含性格、说话习惯、爱好、动机、与玩家的可能关系。"
+    '格式：{"personality":"...","speech_style":"...","hobbies":["..."],'
+    '"motivation":"...","quirks":"...","summary":"一两句总括，供扮演时置顶"}'
 )
 
 NARRATOR_INTRO_SYSTEM = (
@@ -53,13 +65,20 @@ NARRATOR_BRIDGE_SYSTEM = (
 )
 
 NARRATOR_CUE_SYSTEM = (
-    "你是导演兼旁白调度。根据故事背景、角色名单、当前幕次与最近场景记录，"
+    "你是导演调度。根据故事背景、角色名单、当前幕次与最近场景记录，"
     "决定下一位发言者。"
-    "speaker 只能是：某个角色的【精确姓名】、或 Player、或 Narrator。"
-    "to 是发言对象姓名列表（可多人），对象必须来自角色名单或 Player；"
-    "若 speaker 是 Narrator，to 可为 []。"
-    "若本幕该结束，设 end_scene=true（例如剧情自然告一段落时）。"
+    "本幕结构：旁白开场之后，只允许角色名单中的【精确姓名】或 Player 发言；"
+    "禁止再选 Narrator（旁白只在开场/换幕时出现）。"
+    "优先轮流安排不同角色与 Player，尤其是 goal_person 与 competitor。"
+    "to 是发言对象列表（可多人），必须来自角色名单或 Player；角色发言时 to 通常含 Player。"
+    "对白条数未满最少场次前，end_scene 必须为 false；"
+    "达到建议条数后，若剧情告一段落可将 end_scene 设为 true。"
     '只输出 JSON：{"speaker":"...","to":["..."],"end_scene":false,"reason":"..."}'
+)
+
+NARRATOR_CONTINUE_SYSTEM = (
+    "你是旁白。用中文补 1～2 句简短环境/气氛描写，承接当前场景，不要重复开场，"
+    "不要写角色对白，不要输出 JSON。"
 )
 
 CHARACTER_LINE_SYSTEM = (
@@ -73,10 +92,38 @@ class CharacterCard:
     name: str
     slot: str
     description: str
-    persona: str
+    persona: str = ""
+    # Detailed profile from the persona-generator pass (stored, reused on every line).
+    persona_profile: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def acting_brief(self) -> str:
+        """Text injected into the character-line prompt."""
+        parts = [
+            f"剧情身份：{self.description}",
+            f"槽位：{self.slot}",
+        ]
+        if self.persona:
+            parts.append(f"人设摘要：{self.persona}")
+        prof = self.persona_profile or {}
+        if prof.get("summary"):
+            parts.append(f"总括：{prof['summary']}")
+        if prof.get("personality"):
+            parts.append(f"性格：{prof['personality']}")
+        if prof.get("speech_style"):
+            parts.append(f"说话习惯：{prof['speech_style']}")
+        hobbies = prof.get("hobbies")
+        if isinstance(hobbies, list) and hobbies:
+            parts.append("爱好：" + "、".join(str(h) for h in hobbies))
+        elif isinstance(hobbies, str) and hobbies.strip():
+            parts.append(f"爱好：{hobbies}")
+        if prof.get("motivation"):
+            parts.append(f"动机：{prof['motivation']}")
+        if prof.get("quirks"):
+            parts.append(f"小习惯/特点：{prof['quirks']}")
+        return "\n".join(parts)
 
 
 @dataclass
@@ -85,14 +132,17 @@ class StoryState:
     player: dict[str, str] = field(default_factory=dict)
     character_dict: dict[str, CharacterCard] = field(default_factory=dict)
     scene_index: int = 1
-    message_count_in_scene: int = 0
+    message_count_in_scene: int = 0  # all log lines this scene
+    dialogue_count_in_scene: int = 0  # player+NPC lines only (not narrator)
     scene_log: list[dict[str, Any]] = field(default_factory=list)
     current_narration: str = ""
     waiting_for_player: bool = False
     suggested_to: list[str] = field(default_factory=list)
     story_complete: bool = False
     max_scenes: int = MAX_SCENES
-    scene_message_cap: int = SCENE_MESSAGE_CAP
+    scene_dialogue_min: int = SCENE_DIALOGUE_MIN
+    scene_dialogue_max: int = SCENE_DIALOGUE_MAX
+    scene_message_cap: int = SCENE_DIALOGUE_MAX  # alias for UI
     theme: str = ""
 
     def cast_names(self) -> list[str]:
@@ -105,13 +155,16 @@ class StoryState:
             "characters": [c.to_dict() for c in self.character_dict.values()],
             "scene_index": self.scene_index,
             "message_count_in_scene": self.message_count_in_scene,
+            "dialogue_count_in_scene": self.dialogue_count_in_scene,
             "scene_log": list(self.scene_log[-80:]),
             "current_narration": self.current_narration,
             "waiting_for_player": self.waiting_for_player,
             "suggested_to": list(self.suggested_to),
             "story_complete": self.story_complete,
             "max_scenes": self.max_scenes,
-            "scene_message_cap": self.scene_message_cap,
+            "scene_dialogue_min": self.scene_dialogue_min,
+            "scene_dialogue_max": self.scene_dialogue_max,
+            "scene_message_cap": self.scene_dialogue_max,
             "cast_names": self.cast_names(),
         }
 
@@ -168,7 +221,7 @@ def _normalize_name(name: str) -> str:
 def lookup_character(
     character_dict: dict[str, CharacterCard], speaker: str
 ) -> CharacterCard | None:
-    """Resolve speaker via exact key, then for-loop normalized match."""
+    """Resolve speaker via exact key, then for-loop / contains match."""
     raw = (speaker or "").strip()
     if not raw:
         return None
@@ -178,7 +231,37 @@ def lookup_character(
     for name, card in character_dict.items():
         if _normalize_name(name).casefold() == target:
             return card
+    # Model sometimes returns "林晓（女主）" or "角色林晓"
+    for name, card in character_dict.items():
+        n = _normalize_name(name).casefold()
+        if n and (n in target or target in n):
+            return card
     return None
+
+
+def resolve_cue_speaker(state: StoryState, speaker: str) -> tuple[str, CharacterCard | None]:
+    """
+    Map raw cue speaker → ('Player'|'Narrator'|canonical name, card|None).
+    Returns which bucket to use for the next beat.
+    """
+    raw = (speaker or "").strip()
+    if not raw:
+        return PLAYER_KEY, None
+    if raw in {"Player", "玩家", "User", "user", "YOU", "You"}:
+        return PLAYER_KEY, None
+    if raw in {"Narrator", "旁白", "narrator", "NARRATOR"}:
+        return NARRATOR_KEY, None
+    # In-story player name (e.g. 李晨) counts as Player
+    pname = (state.player.get("name") or "").strip()
+    if pname and (
+        raw == pname
+        or _normalize_name(raw).casefold() == _normalize_name(pname).casefold()
+    ):
+        return PLAYER_KEY, None
+    card = lookup_character(state.character_dict, raw)
+    if card is not None:
+        return card.name, card
+    return raw, None
 
 
 def _validate_story_obj(obj: dict) -> tuple[str, dict[str, str], list[CharacterCard]]:
@@ -223,6 +306,39 @@ def _validate_story_obj(obj: dict) -> tuple[str, dict[str, str], list[CharacterC
     return background, player, unique[:5]
 
 
+def enrich_character_persona(
+    model, tokenizer, background: str, card: CharacterCard
+) -> CharacterCard:
+    """Second-pass model: detailed persona from role + story background."""
+    user = (
+        f"故事背景：\n{background}\n\n"
+        f"角色名：{card.name}\n"
+        f"剧情槽位：{card.slot}\n"
+        f"剧情描述：{card.description}\n"
+        "请生成该角色的详细人设 JSON。"
+    )
+    obj = _generate_json(
+        model, tokenizer, PERSONA_GEN_SYSTEM, user, 384
+    ) or {}
+    profile = {
+        "personality": str(obj.get("personality") or "").strip(),
+        "speech_style": str(obj.get("speech_style") or "").strip(),
+        "hobbies": obj.get("hobbies")
+        if isinstance(obj.get("hobbies"), list)
+        else (
+            [str(obj.get("hobbies"))]
+            if isinstance(obj.get("hobbies"), str) and obj.get("hobbies").strip()
+            else []
+        ),
+        "motivation": str(obj.get("motivation") or "").strip(),
+        "quirks": str(obj.get("quirks") or "").strip(),
+        "summary": str(obj.get("summary") or "").strip(),
+    }
+    card.persona_profile = profile
+    card.persona = profile.get("summary") or card.persona or card.description[:80]
+    return card
+
+
 def generate_story_setup(
     model, tokenizer, theme: str | None = None
 ) -> StoryState:
@@ -235,10 +351,21 @@ def generate_story_setup(
     if not obj:
         raise RuntimeError("Story generator returned no JSON")
     background, player, cards = _validate_story_obj(obj)
+    # Dedicated persona pass for each cast member (stored on the card).
+    enriched: list[CharacterCard] = []
+    for card in cards:
+        try:
+            enriched.append(
+                enrich_character_persona(model, tokenizer, background, card)
+            )
+        except Exception as e:
+            print(f"[story] persona gen failed for {card.name}: {e}")
+            card.persona = card.persona or card.description[:80]
+            enriched.append(card)
     state = StoryState(
         background=background,
         player=player,
-        character_dict={c.name: c for c in cards},
+        character_dict={c.name: c for c in enriched},
         theme=(theme or "").strip(),
     )
     return state
@@ -277,12 +404,30 @@ def narrator_intro(model, tokenizer, state: StoryState) -> str:
     )
 
 
+def narrator_continue(model, tokenizer, state: StoryState) -> str:
+    user = (
+        f"背景摘要：\n{state.background[:500]}\n\n"
+        f"当前旁白：\n{state.current_narration or '（无）'}\n\n"
+        f"最近场景：\n{format_scene_log(state.scene_log)}\n"
+    )
+    return generate_chat_text(
+        model,
+        tokenizer,
+        NARRATOR_CONTINUE_SYSTEM,
+        user,
+        NARRATOR_MAX_NEW_TOKENS,
+        temperature=0.6,
+    )
+
+
 def narrator_bridge(model, tokenizer, state: StoryState) -> str:
+    # Called after scene_index has already advanced to the new scene.
+    prev = max(1, state.scene_index - 1)
     user = (
         f"背景：\n{state.background}\n\n"
         f"玩家目标：{state.player.get('goal')}\n"
-        f"刚结束的是第 {state.scene_index} 幕，即将进入第 {state.scene_index + 1} 幕。\n"
-        f"本幕记录：\n{format_scene_log(state.scene_log, 30)}"
+        f"第 {prev} 幕已结束，现在拉开第 {state.scene_index} 幕。\n"
+        f"上一幕记录：\n{format_scene_log(state.scene_log, 30)}"
     )
     return generate_chat_text(
         model,
@@ -324,37 +469,57 @@ def narrator_cue(model, tokenizer, state: StoryState) -> dict[str, Any]:
         f"背景：\n{state.background}\n\n"
         f"玩家名：{state.player.get('name')}（调度时用 Player）\n"
         f"角色名单：\n" + "\n".join(cast_lines) + "\n\n"
-        f"第 {state.scene_index}/{state.max_scenes} 幕，"
-        f"本幕已有 {state.message_count_in_scene}/{state.scene_message_cap} 条记录。\n"
+        f"第 {state.scene_index}/{state.max_scenes} 幕。\n"
         f"当前旁白：\n{state.current_narration or '（无）'}\n\n"
         f"最近场景：\n{format_scene_log(state.scene_log)}\n"
     )
-    if state.message_count_in_scene >= state.scene_message_cap:
-        user += "\n提示：本幕条数已达软上限，可考虑 end_scene=true。"
+    dcount = state.dialogue_count_in_scene
+    user += (
+        f"\n本幕对白条数（不含旁白）：{dcount}/"
+        f"{state.scene_dialogue_min}~{state.scene_dialogue_max}。"
+    )
+    if dcount < state.scene_dialogue_min:
+        user += "\n尚未达到最少对白条数，end_scene 必须为 false，且不要选 Narrator。"
+    elif dcount >= state.scene_dialogue_max:
+        user += "\n已达本幕对白上限，请设 end_scene=true。"
 
     obj = _generate_json(
         model, tokenizer, NARRATOR_CUE_SYSTEM, user, CUE_MAX_NEW_TOKENS
     ) or {}
-    speaker = str(obj.get("speaker") or "Player").strip()
-    if speaker in {"玩家", "User", "user"}:
-        speaker = PLAYER_KEY
-    if speaker in {"旁白", "narrator"}:
-        speaker = NARRATOR_KEY
+    raw_speaker = str(obj.get("speaker") or "").strip()
+    resolved, card = resolve_cue_speaker(state, raw_speaker or PLAYER_KEY)
+
+    def _pick_cast() -> CharacterCard:
+        for c in state.character_dict.values():
+            if c.slot == "goal_person":
+                return c
+        return next(iter(state.character_dict.values()))
+
+    # Mid-scene: never Narrator (opening narrator already happened).
+    if resolved == NARRATOR_KEY and state.cast_names():
+        pick = _pick_cast()
+        resolved, card = pick.name, pick
+        raw_speaker = f"{raw_speaker or 'Narrator'}→override:{pick.name}"
+
     end_scene = bool(obj.get("end_scene"))
-    if state.message_count_in_scene >= state.scene_message_cap:
+    if dcount < state.scene_dialogue_min:
+        end_scene = False
+    if dcount >= state.scene_dialogue_max:
         end_scene = True
     to = clamp_addressees(
         obj.get("to") if isinstance(obj.get("to"), list) else [],
         state,
-        allow_empty=(speaker == NARRATOR_KEY),
+        allow_empty=False,
     )
     return {
-        "speaker": speaker,
+        "speaker": resolved,
+        "raw_speaker": raw_speaker,
         "to": to,
         "end_scene": end_scene,
         "reason": str(obj.get("reason") or "").strip(),
+        "resolve": "ok" if (resolved in (PLAYER_KEY, NARRATOR_KEY) or card) else "miss",
+        "dialogue_count": dcount,
     }
-
 
 def build_character_user_prompt(
     state: StoryState,
@@ -365,15 +530,13 @@ def build_character_user_prompt(
     to_s = "、".join(to) if to else PLAYER_KEY
     return (
         f"你的名字：{card.name}\n"
-        f"身份槽：{card.slot}\n"
-        f"设定：{card.description}\n"
-        f"性格口吻：{card.persona}\n"
+        f"{card.acting_brief()}\n"
         f"你正在对以下人说话：{to_s}\n\n"
         f"故事背景摘要：\n{state.background[:800]}\n\n"
         f"当前旁白：\n{state.current_narration or '（无）'}\n\n"
         f"最近场景：\n{format_scene_log(state.scene_log)}\n\n"
         f"{memory_block}\n\n"
-        "请说出这一句对白："
+        "请严格按人设说这一句对白："
     )
 
 
@@ -414,4 +577,6 @@ def append_log(
     }
     state.scene_log.append(entry)
     state.message_count_in_scene += 1
+    if kind == "dialogue":
+        state.dialogue_count_in_scene += 1
     return entry

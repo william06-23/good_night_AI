@@ -13,8 +13,9 @@ function lineClass(ev) {
 }
 
 function formatEvent(ev) {
-  if (ev.type === 'cue') {
-    return `导演：下一位 ${ev.speaker} → ${(ev.to || []).join('、') || '—'}（${ev.reason || ''}）`
+      if (ev.type === 'cue') {
+    const raw = ev.raw_speaker && ev.raw_speaker !== ev.speaker ? ` [raw:${ev.raw_speaker}]` : ''
+    return `导演：下一位 ${ev.speaker}${raw} → ${(ev.to || []).join('、') || '—'}（${ev.reason || ''}）`
   }
   if (ev.type === 'wait_player') {
     return `轮到你了。建议对象：${(ev.suggested_to || []).join('、') || '任选角色'}`
@@ -232,7 +233,7 @@ export default function StoryApp() {
 
   const cast = story?.cast_names || []
   const sceneLabel = story
-    ? `第 ${story.scene_index}/${story.max_scenes} 幕 · 本幕 ${story.message_count_in_scene}/${story.scene_message_cap}`
+    ? `第 ${story.scene_index}/${story.max_scenes} 幕 · 对白 ${story.dialogue_count_in_scene ?? 0}/${story.scene_dialogue_min ?? 8}~${story.scene_dialogue_max ?? 15}`
     : ''
 
   return (
@@ -328,6 +329,9 @@ export default function StoryApp() {
                 {(story.characters || []).map((c) => (
                   <li key={c.name}>
                     <strong>{c.name}</strong> ({c.slot}) — {c.description}
+                    {c.persona ? (
+                      <div className="persona">人设：{c.persona}</div>
+                    ) : null}
                   </li>
                 ))}
               </ul>

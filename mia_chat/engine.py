@@ -41,6 +41,7 @@ from .story import (
     generate_story_setup,
     lookup_character,
     narrator_bridge,
+    narrator_continue,
     narrator_cue,
     narrator_intro,
 )
@@ -448,7 +449,7 @@ class MiaEngine:
             seeds.append(
                 (
                     card.name,
-                    f"{card.name}（{card.slot}）：{card.description} 性格：{card.persona}",
+                    f"{card.name}（{card.slot}）：{card.description}\n{card.acting_brief()}",
                 )
             )
         for who, text in seeds:
@@ -527,8 +528,16 @@ class MiaEngine:
         state = self.story
         assert state is not None
         events: list[dict[str, Any]] = []
-        hit_cap = state.message_count_in_scene >= state.scene_message_cap
-        if not (cue_end or hit_cap):
+        dcount = state.dialogue_count_in_scene
+        hit_max = dcount >= state.scene_dialogue_max
+        # Need min dialogue before a voluntary end; max forces end.
+        if hit_max:
+            allow = True
+        elif cue_end and dcount >= state.scene_dialogue_min:
+            allow = True
+        else:
+            allow = False
+        if not allow:
             return events
         if state.scene_index >= state.max_scenes:
             state.story_complete = True
@@ -539,14 +548,15 @@ class MiaEngine:
                 }
             )
             return events
+        # Close current scene, then open the next with narrator (structure: Narrator first).
+        state.scene_index += 1
+        state.message_count_in_scene = 0
+        state.dialogue_count_in_scene = 0
         bridge = narrator_bridge(self.model, self.tokenizer, state)
         state.current_narration = bridge
         entry = append_log(
             state, speaker=NARRATOR_KEY, text=bridge, to=[], kind="narrator"
         )
-        events.append({"type": "narrator", **entry})
-        state.scene_index += 1
-        state.message_count_in_scene = 0
         events.append(
             {
                 "type": "scene_start",
@@ -554,6 +564,7 @@ class MiaEngine:
                 "max_scenes": state.max_scenes,
             }
         )
+        events.append({"type": "narrator", **entry})
         return events
 
     def _advance_once_unlocked(self, *, force_cue: bool = False) -> list[dict[str, Any]]:
@@ -565,14 +576,16 @@ class MiaEngine:
         cue = narrator_cue(self.model, self.tokenizer, state)
         events.append({"type": "cue", **cue})
 
-        # Scene end before speaking if narrator says so and there is already content
-        if cue.get("end_scene") and state.message_count_in_scene > 0:
+        # Scene end only after enough dialogue (or at max)
+        if cue.get("end_scene") and state.dialogue_count_in_scene > 0:
             events.extend(self._maybe_end_scene_unlocked(True))
             if state.story_complete:
                 return events
-            # After bridge, cue again for the new scene
-            cue = narrator_cue(self.model, self.tokenizer, state)
-            events.append({"type": "cue", **cue})
+            if events:
+                # New scene always opens with narrator (bridge text already logged).
+                # Cue the first speaker of the new scene.
+                cue = narrator_cue(self.model, self.tokenizer, state)
+                events.append({"type": "cue", **cue})
 
         speaker = str(cue.get("speaker") or PLAYER_KEY)
         to = list(cue.get("to") or [])
@@ -592,30 +605,29 @@ class MiaEngine:
             return events
 
         if speaker == NARRATOR_KEY:
-            # Short narrator beat using intro-style context
-            text = narrator_intro(self.model, self.tokenizer, state)
+            # Should be rare mid-scene; treat as continue beat then force a cast cue next time
+            text = narrator_continue(self.model, self.tokenizer, state)
             state.current_narration = text
             entry = append_log(
                 state, speaker=NARRATOR_KEY, text=text, to=[], kind="narrator"
             )
             events.append({"type": "narrator", **entry})
-            events.extend(
-                self._maybe_end_scene_unlocked(
-                    state.message_count_in_scene >= state.scene_message_cap
-                )
-            )
             return events
 
         card = lookup_character(state.character_dict, speaker)
         if card is None:
-            # Fallback: wait for player
+            # Cue named someone we cannot load — report as resolve miss
             state.waiting_for_player = True
             state.suggested_to = list(state.cast_names()[:1])
             events.append(
                 {
                     "type": "wait_player",
                     "suggested_to": list(state.suggested_to),
-                    "reason": f"未知角色「{speaker}」，改由玩家行动",
+                    "reason": (
+                        f"调用失败：名单中找不到「{cue.get('raw_speaker') or speaker}」"
+                        f"（已解析为 {speaker}），改由玩家行动"
+                    ),
+                    "stage": "lookup",
                 }
             )
             return events
@@ -659,11 +671,9 @@ class MiaEngine:
         except Exception as e:
             print(f"[engine] NPC memory extract failed: {e}")
 
-        # End scene after the line if soft-capped, or if cue requested end
-        # (and we did not already bridge at the top of this advance).
         events.extend(
             self._maybe_end_scene_unlocked(
-                state.message_count_in_scene >= state.scene_message_cap
+                state.dialogue_count_in_scene >= state.scene_dialogue_max
             )
         )
         if cue.get("end_scene") and not state.story_complete:
@@ -718,7 +728,7 @@ class MiaEngine:
         events: list[dict[str, Any]] = [{"type": "player", **entry}]
         events.extend(
             self._maybe_end_scene_unlocked(
-                state.message_count_in_scene >= state.scene_message_cap
+                state.dialogue_count_in_scene >= state.scene_dialogue_max
             )
         )
         return {

@@ -74,6 +74,12 @@ button:disabled {
   font-size: 0.85rem;
 }
 
+.cast .persona {
+  margin-top: 0.2rem;
+  color: #555;
+  font-size: 0.8rem;
+}
+
 .feed-panel .feed {
   max-height: 420px;
   overflow-y: auto;

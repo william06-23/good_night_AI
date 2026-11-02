@@ -6,7 +6,7 @@ Active feature branch for text-game work: **`AI_text_game`**.
 
 ## What this project is
 
-On **`AI_text_game`**: a **directed text adventure**. One GPU Qwen (7B/14B) plays story generator, narrator/director, and all NPC voices via different prompts. **bge-m3** (CPU) retrieves multi-perspective memories (`Narrator` / `Player` / per-NPC string lists). Cast template: competitor + goal person + 2–3 supporting. Up to **5 scenes**, ~**15** lines soft-cap per scene. Every dialogue line has addressees (`to[]`): player picks via checkboxes; narrator cue sets NPC targets. Web test UI: [`web/src/StoryApp.jsx`](web/src/StoryApp.jsx).
+On **`AI_text_game`**: a **directed text adventure**. One GPU Qwen (7B/14B) plays story generator, **persona designer**, narrator/director, and all NPC voices via different prompts. **bge-m3** (CPU) retrieves multi-perspective memories (`Narrator` / `Player` / per-NPC string lists). Cast template: competitor + goal person + 2–3 supporting. After story JSON, a **persona pass** fills each cast member’s `persona_profile` (personality, speech_style, hobbies, motivation, quirks, summary) from role + background; stored on the card and injected via `acting_brief()` on every character line. **Scene structure:** Narrator opens each scene → then **8–15** player/NPC dialogue lines (narrator mid-scene forbidden; `end_scene` blocked before min, forced at max). Max **5** scenes. Every dialogue line has addressees (`to[]`). Web test UI: [`web/src/StoryApp.jsx`](web/src/StoryApp.jsx).
 
 ## External dependencies (not committed)
 
@@ -98,7 +98,7 @@ Values are plain strings only (no certainty / UUID / timestamps on disk).
 
 ### `mia_chat/story.py`
 
-Story setup JSON, narrator intro/bridge/cue, character-line prompts, `StoryState`, `lookup_character` (dict + for-loop name match).
+Story setup JSON → `enrich_character_persona` per cast member → `StoryState`. Narrator intro/bridge/cue (cue never picks Narrator mid-scene; dialogue min/max gates `end_scene`). Character lines use `CharacterCard.acting_brief()`. `append_log` increments `dialogue_count_in_scene` only for `kind=dialogue`.
 
 ### `mia_chat/api.py`
 
