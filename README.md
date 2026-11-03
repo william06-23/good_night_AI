@@ -1,21 +1,23 @@
-# Good Night AI (Mia)
+# AI Text Game
 
-Local chat with Mia, your girlfriend. Short-term chat stays in RAM for this session. Long-term memory is multi-perspective JSON in `mia_chat/data/long_term_memory.json` (`Narrator` / `Player` / NPC string lists). On each turn, `BAAI/bge-m3` (CPU) retrieves from those buckets and injects them into the prompt.
+Directed text adventure (branch **`AI_text_game`**). One local Qwen (7B/14B) plays story generator, persona designer, narrator/director, and NPC voices. **bge-m3** (CPU) retrieves multi-perspective memories (`Narrator` / `Player` / per-NPC).
 
-You can run Qwen 2.5 **7B** (4-bit, transformers) or **14B** (GGUF, llama.cpp). On branch **`AI_text_game`**, the web UI (`StoryApp`) is a directed text-adventure test harness (generate story → narrator cues → talk with checkbox addressees). The dating-sim version lives on `Rizz-the-AI`; classic girlfriend chat on `master`.
+Toggle **中文 / EN** in the web UI (top right) before generating — story setup, personas, narration, and dialogue all follow that language.
 
-This folder is the chat program. Model weights go in a local `models/` folder (gitignored). The Python env is `.venv` at the repo root.
+Classic girlfriend chat lives on `master`; dating-sim on `Rizz-the-AI`.
 
-## What another machine needs
+## Setup
 
-- Windows
-- An NVIDIA GPU. 7B 4-bit wants about 6 GB VRAM. 14B GGUF keeps most layers on the GPU and the rest in RAM
-- A recent NVIDIA driver
-- Python **3.11 or 3.12** (3.14 is too new for these packages)
-- Node.js, for the web UI
-- Internet the first time, if weights are downloaded instead of copied
+Model weights go in `models/` (gitignored) or under `AI_TEXT_GAME_MODELS_DIR` (legacy alias: `MIA_MODELS_DIR`). Prefer a repo `.venv`, or copy `local_env.bat.example` → `local_env.bat` for machine-specific Python/models paths.
 
-## Python packages
+### What you need
+
+- Windows + NVIDIA GPU (7B ≈ 6 GB VRAM; 14B GGUF uses GPU + RAM)
+- Python **3.11 or 3.12**
+- Node.js (web UI)
+- Internet the first time if downloading weights
+
+### Python packages
 
 ```bat
 py -3.12 -m venv .venv
@@ -24,27 +26,16 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install transformers accelerate bitsandbytes sentence-transformers huggingface_hub fastapi uvicorn llama-cpp-python
 ```
 
-Use the CUDA wheel that matches the GPU driver. `cu124` is a common CUDA 12 index. The 14B path also needs the CUDA 12 runtime DLLs in `models/llama_cpp_cudart12`. `run_api.bat` and `run_mia.bat` put that folder on `PATH`.
-
 In `web/`, run `npm install` once.
 
-## Model weights
+### Model layout
 
-Not bundled in this repo. Put them under `models/` next to the launchers:
-
-| Role | Runs on | Default path |
-|------|---------|--------------|
-| Chat, Qwen 2.5 7B 4-bit | GPU | `models/Qwen2.5-7B-Instruct-bnb-4bit` |
-| Chat, Qwen 2.5 14B GGUF Q4_K_M | GPU + RAM | `models/Qwen2.5-14B-Instruct-GGUF/Qwen2.5-14B-Instruct-Q4_K_M.gguf` |
-| Memory retrieval (`BAAI/bge-m3`) | CPU | `models/bge-m3` |
-| llama-cpp CUDA 12 DLLs | — | `models/llama_cpp_cudart12` |
-
-Downloads if you are not copying folders:
-
-- 7B: `unsloth/Qwen2.5-7B-Instruct-bnb-4bit`
-- Retriever: `BAAI/bge-m3` (or run `python -m mia_chat._download_bge_m3`)
-
-To use weights somewhere else, set `MIA_MODELS_DIR` to that folder (same layout as `models/` above).
+| Role | Path |
+|------|------|
+| Qwen 2.5 7B 4-bit | `models/Qwen2.5-7B-Instruct-bnb-4bit` |
+| Qwen 2.5 14B GGUF | `models/Qwen2.5-14B-Instruct-GGUF/Qwen2.5-14B-Instruct-Q4_K_M.gguf` |
+| bge-m3 | `models/bge-m3` |
+| llama-cpp CUDA 12 DLLs | `models/llama_cpp_cudart12` |
 
 ## How to run
 
@@ -52,40 +43,34 @@ To use weights somewhere else, set `MIA_MODELS_DIR` to that folder (same layout 
 
 Double-click **`run_web.bat`**.
 
-1. A **Mia API** window starts at http://127.0.0.1:8000. It does not load a chat model until you pick one.
-2. Vite opens http://127.0.0.1:5173. Choose **7B** or **14B** there.
+1. API at http://127.0.0.1:8000 (pick 7B/14B in the UI)
+2. Vite at http://127.0.0.1:5173 — set language → generate story → start scene → advance / speak
 
-If the page says the API is offline, wait until the API window is up.
+### CLI (no browser)
 
-`run_api.bat` alone is enough for API debugging.
-
-Leave a session with `good night`, `night night`, `晚安`, or `exit`. Mia replies first, then long-term memory is organized.
-
-**New session** clears only the model’s short-term context. The transcript and long-term memory stay.
-
-### CLI
-
-Create `.venv` as above, then double-click **`run_mia.bat`**, or:
+Double-click **`run_story.bat`**, or:
 
 ```bat
 set PYTHONPATH=%CD%
-.venv\Scripts\python.exe -m mia_chat.chat_cli
+.venv\Scripts\python.exe -m ai_text_game.story_cli
 ```
+
+### API only
+
+`run_api.bat` → `uvicorn ai_text_game.api:app`
+
+## Package layout
+
+Python package: **`ai_text_game/`** (engine, story, memory, API).
+
+Runtime data (gitignored): `ai_text_game/data/`.
 
 ## API
 
 - `GET /api/health`
-- `POST /api/model` and `POST /api/model/retry`
-- `GET /api/memory` (character → string lists)
-- `GET /api/characters`
-- `POST /api/story/generate`, `/api/story/intro`, `/api/story/advance`
-- `GET /api/chat/history`
-- `POST /api/chat` (`to` list required in story mode)
+- `POST /api/model`, `/api/model/retry`
+- `GET /api/memory`, `/api/characters`, `/api/story`
+- `POST /api/story/generate` — `{ theme?, language?: "zh"|"en" }`
+- `POST /api/story/intro`, `/api/story/advance`
+- `POST /api/chat` — `{ message, to: string[] }`
 - `POST /api/session/reset`
-
-## Private runtime files
-
-These are created on first use and are gitignored:
-
-- `mia_chat/data/chat_log.jsonl`
-- `mia_chat/data/long_term_memory.json`

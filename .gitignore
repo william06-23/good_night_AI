@@ -2,9 +2,14 @@
 *.pyc
 .venv/
 models/
+# Machine-specific Python / models paths (see local_env.bat.example)
+local_env.bat
+mia_local.bat
 *.egg-info/
 .DS_Store
 
 # Personal runtime data (created empty on first run)
+ai_text_game/data/chat_log.jsonl
+ai_text_game/data/long_term_memory.json
 mia_chat/data/chat_log.jsonl
 mia_chat/data/long_term_memory.json

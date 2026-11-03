@@ -54,9 +54,10 @@ def log_turn(
     session_id: str,
     path: Path = CHAT_LOG_PATH,
 ) -> None:
-    """Save one user + Mia exchange as-is."""
+    """Save one user (+ optional assistant) exchange as-is."""
     append_log_event("user", user_text, session_id, path=path)
-    append_log_event("assistant", assistant_text, session_id, path=path)
+    if (assistant_text or "").strip():
+        append_log_event("assistant", assistant_text, session_id, path=path)
 
 
 def _ts_to_ms(ts_iso: str | None) -> int | None:

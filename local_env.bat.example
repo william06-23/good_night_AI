@@ -1,0 +1,12 @@
+@echo off
+rem Copy to local_env.bat and edit paths for your machine.
+rem local_env.bat is gitignored — do not commit personal paths.
+rem
+rem If a path contains an apostrophe ('), do NOT wrap the value in quotes:
+rem   set PY=C:\path\with'\apostrophe\python.exe
+rem Otherwise quotes are fine:
+rem   set "PY=C:\path\to\env\Scripts\python.exe"
+rem   set "AI_TEXT_GAME_MODELS_DIR=C:\path\to\models_root"
+
+set PY=C:\path\to\your\env\Scripts\python.exe
+set AI_TEXT_GAME_MODELS_DIR=C:\path\to\your\models_root

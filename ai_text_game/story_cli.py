@@ -4,7 +4,22 @@ CLI for the directed text game — no Vite/browser required.
 
 from __future__ import annotations
 
-from .engine import MiaEngine
+import time
+
+from .engine import LINE_BEAT_SECONDS, TextGameEngine
+
+
+def _drain_auto(engine: TextGameEngine, result: dict) -> None:
+    """Follow auto_continue beats (CLI has no parallel interrupt typing)."""
+    while result.get("auto_continue"):
+        beat = float(result.get("beat_seconds") or LINE_BEAT_SECONDS)
+        time.sleep(max(0.5, beat))
+        try:
+            result = engine.advance_scene()
+        except (ValueError, RuntimeError) as e:
+            print(f"[error] {e}")
+            return
+        _print_events(result.get("events") or [])
 
 
 def _print_events(events: list) -> None:
@@ -59,7 +74,7 @@ def _pick_addressees(cast: list[str], suggested: list[str] | None = None) -> lis
 
 
 def main() -> None:
-    engine = MiaEngine()
+    engine = TextGameEngine()
     print("AI Text Game CLI (no browser)")
     print("Choose model: 1 = 7B   2 = 14B")
     choice = input("Model [1]: ").strip() or "1"
@@ -67,9 +82,13 @@ def main() -> None:
     print(f"Loading {model_key}…")
     engine.load(model_key)
 
-    theme = input("Optional theme (Enter to skip): ").strip() or None
+    lang_raw = input("Language [zh/en] (default zh): ").strip().lower() or "zh"
+    language = "en" if lang_raw.startswith("en") else "zh"
+    theme = input(
+        "Theme (~8–80 chars, fed into setup; Enter to skip): "
+    ).strip() or None
     print("Generating story…")
-    result = engine.generate_story(theme=theme)
+    result = engine.generate_story(theme=theme, language=language)
     story = result["story"]
     print("\n===== SETUP =====")
     print(f"Player: {story['player'].get('name')} — {story['player'].get('identity')}")
@@ -81,7 +100,7 @@ def main() -> None:
     input("\nPress Enter to start scene 1…")
     intro = engine.start_intro()
     _print_events(intro.get("events") or [])
-    story = intro.get("story") or engine.story.public_dict()
+    _drain_auto(engine, intro)
 
     print(
         "\nCommands: Enter = advance cue | type text = your interrupt | "
@@ -89,7 +108,7 @@ def main() -> None:
     )
 
     while True:
-        story = engine.story.public_dict() if engine.story else story
+        story = engine.story.public_dict() if engine.story else {}
         if story.get("story_complete"):
             print("\n[story complete]")
             break
@@ -116,6 +135,7 @@ def main() -> None:
                 print(f"[error] {e}")
                 continue
             _print_events(adv.get("events") or [])
+            _drain_auto(engine, adv)
             continue
 
         cast = story.get("cast_names") or []
@@ -126,6 +146,7 @@ def main() -> None:
             print(f"[error] {e}")
             continue
         _print_events(out.get("events") or [])
+        _drain_auto(engine, out)
 
 
 if __name__ == "__main__":

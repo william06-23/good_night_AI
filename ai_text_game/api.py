@@ -1,5 +1,5 @@
 """
-FastAPI server for Mia / text-game — load models once, chat + story via HTTP.
+FastAPI server for the directed text game — load models once, story via HTTP.
 """
 
 from __future__ import annotations
@@ -7,25 +7,24 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .chat_log import load_messages
-from .engine import MiaEngine
+from .engine import TextGameEngine
 from .memory import list_speakable_characters, load_memory, public_memory_store
 
-engine = MiaEngine()
+engine = TextGameEngine()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Mia API up. Waiting for a model choice (7b or 14b) from the UI.")
+    print("AI Text Game API up. Waiting for a model choice (7b or 14b) from the UI.")
     yield
-    print("Mia API shutting down.")
+    print("AI Text Game API shutting down.")
 
 
-app = FastAPI(title="Good Night AI — Text Game", lifespan=lifespan)
+app = FastAPI(title="AI Text Game", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -42,8 +41,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
-    character: str | None = None
-    to: list[str] | None = None
+    to: list[str] = Field(default_factory=list)
 
 
 class ModelChoice(BaseModel):
@@ -52,18 +50,7 @@ class ModelChoice(BaseModel):
 
 class ThemeBody(BaseModel):
     theme: str | None = None
-
-
-class ChatResponse(BaseModel):
-    reply: str = ""
-    recalled: list[dict[str, Any]] = Field(default_factory=list)
-    ended: bool = False
-    facts_count: int = 0
-    session_id: str = ""
-    character: str = ""
-    to: list[str] = Field(default_factory=list)
-    events: list[dict[str, Any]] = Field(default_factory=list)
-    story: dict[str, Any] | None = None
+    language: str | None = "zh"
 
 
 @app.get("/api/health")
@@ -113,13 +100,20 @@ def get_story() -> dict[str, Any]:
     }
 
 
+@app.get("/api/story/live")
+def story_live(since: int = Query(0, ge=0)) -> dict[str, Any]:
+    """Poll while a background intro/advance/chat job is running (~0.25s)."""
+    return engine.poll_live(since)
+
+
 @app.post("/api/story/generate")
 def story_generate(body: ThemeBody | None = None) -> dict[str, Any]:
     if not engine.ready:
         raise HTTPException(503, "Engine not ready — still loading?")
     theme = body.theme if body else None
+    language = (body.language if body else None) or "zh"
     try:
-        return engine.generate_story(theme=theme)
+        return engine.generate_story(theme=theme, language=language)
     except Exception as e:
         raise HTTPException(500, str(e)) from e
 
@@ -129,7 +123,7 @@ def story_intro() -> dict[str, Any]:
     if not engine.ready:
         raise HTTPException(503, "Engine not ready")
     try:
-        return engine.start_intro()
+        return engine.begin_intro_job()
     except Exception as e:
         raise HTTPException(400, str(e)) from e
 
@@ -139,37 +133,21 @@ def story_advance() -> dict[str, Any]:
     if not engine.ready:
         raise HTTPException(503, "Engine not ready")
     try:
-        return engine.advance_scene()
+        return engine.begin_advance_job()
     except Exception as e:
         raise HTTPException(400, str(e)) from e
 
 
-@app.get("/api/chat/history")
-def chat_history() -> dict[str, Any]:
-    return {"messages": load_messages()}
-
-
-@app.post("/api/chat", response_model=ChatResponse)
-def chat(body: ChatRequest) -> ChatResponse:
+@app.post("/api/chat")
+def chat(body: ChatRequest) -> dict[str, Any]:
     if not engine.ready:
         raise HTTPException(503, "Engine not ready — still loading?")
     try:
-        result = engine.chat(body.message, character=body.character, to=body.to)
+        return engine.begin_chat_job(body.message, to=body.to)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
-    return ChatResponse(
-        reply=result.get("reply") or "",
-        recalled=result.get("recalled") or [],
-        ended=bool(result.get("ended")),
-        facts_count=int(result.get("facts_count") or 0),
-        session_id=result.get("session_id") or "",
-        character=result.get("character") or "",
-        to=result.get("to") or [],
-        events=result.get("events") or [],
-        story=result.get("story"),
-    )
 
 
 @app.post("/api/session/reset")

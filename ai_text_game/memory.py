@@ -16,7 +16,15 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 MEMORY_PATH = DATA_DIR / "long_term_memory.json"
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_MODELS_DIR = Path(os.environ.get("MIA_MODELS_DIR", _REPO_ROOT / "models")).expanduser()
+def _resolve_models_dir() -> Path:
+    for key in ("AI_TEXT_GAME_MODELS_DIR", "MIA_MODELS_DIR"):
+        raw = os.environ.get(key)
+        if raw:
+            return Path(raw).expanduser()
+    return _REPO_ROOT / "models"
+
+
+_MODELS_DIR = _resolve_models_dir()
 EMBED_MODEL_ID = str(_MODELS_DIR / "bge-m3")
 EMBED_DEVICE = "cpu"
 RETRIEVE_TOP_K = 5
@@ -32,54 +40,29 @@ ORGANIZE_MAX_NEW_TOKENS = 96
 MAX_FACTS_PER_TURN = 5
 MEMORY_CONTEXT_MESSAGES = 5
 
-# Fixed perspective keys + speakable NPC roster.
+# Fixed perspective keys + speakable NPC roster (filled after story generation).
 NARRATOR_KEY = "Narrator"
 PLAYER_KEY = "Player"
-DEFAULT_CHARACTER = "Mia"
-SPEAKABLE_CHARACTERS = [DEFAULT_CHARACTER]
+# Legacy girlfriend-chat default; kept only so old memory JSON still loads.
+LEGACY_DEFAULT_CHARACTER = "Mia"
+DEFAULT_CHARACTER = LEGACY_DEFAULT_CHARACTER  # alias used by older call sites
+SPEAKABLE_CHARACTERS: list[str] = []
 SESSION_NEW_KEY = "_session_new"  # in-RAM only; never written to JSON
+_ACTIVE_LANGUAGE = "zh"
 
-GATE_SYSTEM = (
-    "你是一个记忆筛选器。结合最近对话上下文，判断【最新一轮】是否包含值得长期记住的信息。"
-    "值得记住：个人事实、身份、地点、计划、关系、承诺、重要情绪；"
-    "以及各类偏好与喜好（喜欢/讨厌的食物、颜色、活动、习惯、口味等），即使说得随意也算重要。"
-    "不值得：纯寒暄、无信息的玩笑、一次性语气词、没有新信息的附和。"
-    "若最新一句本身含糊，但结合上文能确定是在陈述偏好或事实，也判 important。"
-    '只输出 JSON，格式严格为：{"important": true} 或 {"important": false}'
-)
 
-REWRITE_NARRATOR_SYSTEM = (
-    "你是客观旁白记忆整理器。根据最近对话，把【最新一轮】里值得长期记住的信息"
-    "改写成简短、第三人称、客观的陈述句（旁白视角，不偏任何一方）。"
-    "必须结合上文理解指代与省略。默认 1 条，最多 5 条互不相关的独立信息。"
-    "没有可记内容则输出空数组。不要撒娇口吻。"
-    '只输出 JSON：{"facts": ["事实1", ...]}'
-)
+def set_memory_language(lang: str) -> None:
+    """Story language drives memory gate/rewrite prompts."""
+    global _ACTIVE_LANGUAGE
+    from .prompts import normalize_lang
 
-REWRITE_PLAYER_SYSTEM = (
-    "你是玩家视角记忆整理器。根据最近对话，把【最新一轮】里玩家会记住的信息"
-    "改写成简短陈述，用玩家第一人称「我」或「用户」指自己，对方用名字。"
-    "只写玩家会关心/会记住的内容。默认 1 条，最多 5 条。没有可记内容则空数组。"
-    '只输出 JSON：{"facts": ["事实1", ...]}'
-)
+    _ACTIVE_LANGUAGE = normalize_lang(lang)
 
-REWRITE_OTHER_SYSTEM = (
-    "你是角色视角记忆整理器。角色名会在用户消息里给出。"
-    "把【最新一轮】里该角色会记住的信息改写成简短陈述，用该角色第一人称「我」，"
-    "把玩家称为「用户」或对方的称呼。只写该角色视角下稳定、可回忆的内容。"
-    "默认 1 条，最多 5 条。没有可记内容则空数组。"
-    '只输出 JSON：{"facts": ["事实1", ...]}'
-)
 
-ORGANIZE_SYSTEM = (
-    "你是记忆冲突仲裁器。比较同一视角下的两条记忆，判断关系。"
-    'relation 只能是 "same"、"contradict"、"unrelated" 之一。'
-    "same：几乎同一条事实的同义改写。"
-    "contradict：两条不能同时为真。"
-    "unrelated：可以同时为真。"
-    "多种称呼/喜好可以并存 → unrelated。"
-    '只输出 JSON：{"relation": "same"|"contradict"|"unrelated"}'
-)
+def _memory_prompt_pack() -> dict[str, str]:
+    from .prompts import memory_prompts
+
+    return memory_prompts(_ACTIVE_LANGUAGE)
 
 _CALL_PREF_RE = re.compile(
     r"称呼|叫作|叫我|叫他|叫她|昵称|宝宝|老公|老婆|亲爱的|"
@@ -109,8 +92,6 @@ def set_speakable_characters(names: list[str]) -> list[str]:
             continue
         seen.add(name)
         cleaned.append(name)
-    if not cleaned:
-        cleaned = [DEFAULT_CHARACTER]
     SPEAKABLE_CHARACTERS = cleaned
     return list(SPEAKABLE_CHARACTERS)
 
@@ -129,10 +110,9 @@ def _normalize(text: str) -> str:
 
 
 def _empty_store() -> dict:
-    store = {
+    store: dict = {
         NARRATOR_KEY: [],
         PLAYER_KEY: [],
-        DEFAULT_CHARACTER: [],
     }
     for name in SPEAKABLE_CHARACTERS:
         store.setdefault(name, [])
@@ -192,7 +172,7 @@ def public_memory_store(store: dict) -> dict:
             if (isinstance(x, str) and x.strip())
             or (isinstance(x, dict) and (x.get("text") or "").strip())
         ]
-    for required in (NARRATOR_KEY, PLAYER_KEY, DEFAULT_CHARACTER):
+    for required in (NARRATOR_KEY, PLAYER_KEY):
         out.setdefault(required, [])
     for name in SPEAKABLE_CHARACTERS:
         out.setdefault(name, [])
@@ -279,6 +259,21 @@ def load_memory(path: Path = MEMORY_PATH) -> dict:
         return store
     except (json.JSONDecodeError, OSError):
         return _empty_store()
+
+
+def wipe_memory(path: Path = MEMORY_PATH) -> dict:
+    """
+    Clear all persisted memories (new story). Roster keys are empty until seed.
+    """
+    global SPEAKABLE_CHARACTERS
+    SPEAKABLE_CHARACTERS = []
+    store = {
+        NARRATOR_KEY: [],
+        PLAYER_KEY: [],
+        SESSION_NEW_KEY: {},
+    }
+    save_memory(store, path)
+    return store
 
 
 def save_memory(store: dict, path: Path = MEMORY_PATH) -> None:
@@ -573,7 +568,7 @@ def _format_recent_dialogue(
     history: list[dict] | None,
     user_text: str,
     assistant_text: str = "",
-    character: str = DEFAULT_CHARACTER,
+    character: str = "",
     max_messages: int = MEMORY_CONTEXT_MESSAGES,
 ) -> str:
     lines: list[str] = []
@@ -607,13 +602,17 @@ def is_important(
     user_text: str,
     assistant_text: str = "",
     history: list[dict] | None = None,
-    character: str = DEFAULT_CHARACTER,
+    character: str = "",
 ) -> bool:
     user_blob = _format_recent_dialogue(
         history, user_text, assistant_text, character=character
     )
     obj = _generate_json(
-        model, tokenizer, GATE_SYSTEM, user_blob, GATE_MAX_NEW_TOKENS
+        model,
+        tokenizer,
+        _memory_prompt_pack()["gate"],
+        user_blob,
+        GATE_MAX_NEW_TOKENS,
     )
     if not obj:
         return False
@@ -653,19 +652,21 @@ def summarize_for_perspective(
     user_text: str,
     assistant_text: str = "",
     history: list[dict] | None = None,
-    character: str = DEFAULT_CHARACTER,
+    character: str = "",
 ) -> list[str]:
     """Rewrite important content for Narrator, Player, or interlocutor POV."""
     user_blob = _format_recent_dialogue(
         history, user_text, assistant_text, character=character
     )
+    mp = _memory_prompt_pack()
     if perspective == NARRATOR_KEY:
-        system = REWRITE_NARRATOR_SYSTEM
+        system = mp["rewrite_narrator"]
     elif perspective == PLAYER_KEY:
-        system = REWRITE_PLAYER_SYSTEM
+        system = mp["rewrite_player"]
     else:
-        system = REWRITE_OTHER_SYSTEM
-        user_blob = f"角色名：{character}\n{user_blob}"
+        system = mp["rewrite_other"]
+        label = "Character name" if _ACTIVE_LANGUAGE == "en" else "角色名"
+        user_blob = f"{label}：{character}\n{user_blob}"
     obj = _generate_json(
         model, tokenizer, system, user_blob, REWRITE_MAX_NEW_TOKENS
     )
@@ -710,6 +711,40 @@ def _store_one_string(
     return text
 
 
+def record_dialogue_beat(
+    store: dict,
+    *,
+    speaker: str,
+    text: str,
+    to: list[str] | None = None,
+    path: Path = MEMORY_PATH,
+    retriever: MemoryRetriever | None = None,
+) -> str | None:
+    """
+    Always store a short beat for the speaker so the next cue sees fresh context.
+    No importance gate / rewrite — used by the directed story loop.
+    """
+    speaker = (speaker or "").strip()
+    text = (text or "").strip()
+    if not speaker or not text:
+        return None
+    if speaker in (NARRATOR_KEY, PLAYER_KEY):
+        who = speaker
+    elif is_speakable(speaker):
+        who = speaker
+    else:
+        return None
+    join = "、"
+    to_s = join.join(t for t in (to or []) if t) or "—"
+    if speaker == NARRATOR_KEY:
+        beat = f"旁白：{text}"
+    elif speaker == PLAYER_KEY:
+        beat = f"玩家对{to_s}说：{text}"
+    else:
+        beat = f"{speaker}对{to_s}说：{text}"
+    return _store_one_string(store, who, beat, path, retriever)
+
+
 def extract_and_store(
     model,
     tokenizer,
@@ -720,13 +755,18 @@ def extract_and_store(
     retriever: MemoryRetriever | None = None,
     recalled_hits: list[dict] | None = None,
     history: list[dict] | None = None,
-    character: str = DEFAULT_CHARACTER,
+    character: str = "",
+    *,
+    skip_gate: bool = False,
 ) -> dict[str, list[str]]:
     """
     Gate once → rewrite Narrator / Player / interlocutor → store each list.
+    Set skip_gate=True in story mode so dialogue beats are not dropped.
     """
     _ = recalled_hits  # available for future scoring; unused without certainty
-    character = (character or DEFAULT_CHARACTER).strip()
+    character = (character or "").strip()
+    if not character:
+        raise ValueError("character required for memory extract")
     if not is_speakable(character):
         raise ValueError(f"Unknown speakable character: {character}")
     if character in (NARRATOR_KEY, PLAYER_KEY):
@@ -735,7 +775,7 @@ def extract_and_store(
     if not user_text or not user_text.strip():
         return {NARRATOR_KEY: [], PLAYER_KEY: [], character: []}
 
-    if not is_important(
+    if not skip_gate and not is_important(
         model,
         tokenizer,
         user_text,
@@ -798,7 +838,13 @@ def classify_relation(model, tokenizer, text_a: str, text_b: str) -> str:
         return "unrelated"
 
     blob = f"事实A：{text_a}\n事实B：{text_b}"
-    obj = _generate_json(model, tokenizer, ORGANIZE_SYSTEM, blob, ORGANIZE_MAX_NEW_TOKENS)
+    obj = _generate_json(
+        model,
+        tokenizer,
+        _memory_prompt_pack()["organize"],
+        blob,
+        ORGANIZE_MAX_NEW_TOKENS,
+    )
     if not obj:
         return "unrelated"
     rel = str(obj.get("relation", "unrelated")).strip().lower()
