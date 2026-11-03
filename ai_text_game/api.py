@@ -40,7 +40,8 @@ app.add_middleware(
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1)
+    message: str = ""
+    action: str = ""
     to: list[str] = Field(default_factory=list)
 
 
@@ -51,6 +52,10 @@ class ModelChoice(BaseModel):
 class ThemeBody(BaseModel):
     theme: str | None = None
     language: str | None = "zh"
+
+
+class SettingsBody(BaseModel):
+    actions_enabled: bool | None = None
 
 
 @app.get("/api/health")
@@ -142,12 +147,23 @@ def story_advance() -> dict[str, Any]:
 def chat(body: ChatRequest) -> dict[str, Any]:
     if not engine.ready:
         raise HTTPException(503, "Engine not ready — still loading?")
+    message = (body.message or "").strip()
+    action = (body.action or "").strip()
+    if not message and not action:
+        raise HTTPException(400, "Empty message")
     try:
-        return engine.begin_chat_job(body.message, to=body.to)
+        return engine.begin_chat_job(message, to=body.to, action=action)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
+
+
+@app.post("/api/settings")
+def update_settings(body: SettingsBody) -> dict[str, Any]:
+    if body.actions_enabled is not None:
+        engine.set_actions_enabled(bool(body.actions_enabled))
+    return engine.status()
 
 
 @app.post("/api/session/reset")

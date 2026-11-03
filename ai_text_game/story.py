@@ -31,6 +31,8 @@ SCENE_DIALOGUE_MIN = 8
 SCENE_DIALOGUE_MAX = 15
 # Prefer NPCs for this many dialogue lines before Player is normally cued.
 PLAYER_CUE_AFTER_NPC_LINES = 3
+# Mid-scene Narrator stage beats allowed after this many dialogue lines.
+NARRATOR_ACTION_AFTER_DIALOGUE = 2
 # Soft length guidance for theme input (Chinese chars / short English phrases).
 THEME_RECOMMENDED_MIN_CHARS = 8
 THEME_RECOMMENDED_MAX_CHARS = 80
@@ -50,7 +52,7 @@ class CharacterCard:
         return asdict(self)
 
     def acting_brief(self, lang: str = "zh") -> str:
-        """Text injected into the character-line prompt."""
+        """Text injected into the character-line system prompt (fixed persona)."""
         en = normalize_lang(lang) == "en"
         join_h = ", " if en else "、"
         parts = [
@@ -70,6 +72,11 @@ class CharacterCard:
                 "hobbies": "Hobbies",
                 "motivation": "Motivation",
                 "quirks": "Quirks",
+                "goals": "Goals",
+                "supports": "Supports / stands for",
+                "disapproves": "Disapproves / opposes",
+                "attitudes": "Attitudes toward others",
+                "stance": "Stance",
             }
             if en
             else {
@@ -79,6 +86,11 @@ class CharacterCard:
                 "hobbies": "爱好",
                 "motivation": "动机",
                 "quirks": "小习惯/特点",
+                "goals": "目标",
+                "supports": "支持/认同",
+                "disapproves": "反对/不认同",
+                "attitudes": "对其余人态度",
+                "stance": "立场",
             }
         )
         if prof.get("summary"):
@@ -96,6 +108,26 @@ class CharacterCard:
             parts.append(f"{labels['motivation']}：{prof['motivation']}")
         if prof.get("quirks"):
             parts.append(f"{labels['quirks']}：{prof['quirks']}")
+
+        stance_bits = []
+        if prof.get("goals"):
+            stance_bits.append(f"{labels['goals']}：{prof['goals']}")
+        if prof.get("supports"):
+            stance_bits.append(f"{labels['supports']}：{prof['supports']}")
+        if prof.get("disapproves"):
+            stance_bits.append(f"{labels['disapproves']}：{prof['disapproves']}")
+        if stance_bits:
+            parts.append(labels["stance"] + "：")
+            parts.extend(stance_bits)
+
+        attitudes = prof.get("attitudes")
+        if isinstance(attitudes, dict) and attitudes:
+            parts.append(labels["attitudes"] + "：")
+            for who, take in attitudes.items():
+                who_s = str(who or "").strip()
+                take_s = str(take or "").strip()
+                if who_s and take_s:
+                    parts.append(f"- {who_s}：{take_s}")
         return "\n".join(parts)
 
 
@@ -127,6 +159,8 @@ class StoryState:
     pending_reactions: list[dict[str, Any]] = field(default_factory=list)
     # After a line, next advance should open the next scene (cast + bridge).
     pending_scene_bridge: bool = False
+    # Experimental: NPCs/player may attach small stage actions; player actions are model-checked.
+    actions_enabled: bool = False
 
     def cast_names(self) -> list[str]:
         return list(self.character_dict.keys())
@@ -160,10 +194,19 @@ class StoryState:
             "language": normalize_lang(self.language),
             "pending_reactions": len(self.pending_reactions),
             "pending_scene_bridge": bool(self.pending_scene_bridge),
+            "actions_enabled": bool(self.actions_enabled),
             "theme_hint": (
-                f"Recommended theme length: about {THEME_RECOMMENDED_MIN_CHARS}–"
-                f"{THEME_RECOMMENDED_MAX_CHARS} characters "
-                "(one short phrase or 1–2 sentences)."
+                (
+                    f"Recommended theme length: about {THEME_RECOMMENDED_MIN_CHARS}–"
+                    f"{THEME_RECOMMENDED_MAX_CHARS} characters "
+                    "(one short phrase or 1–2 sentences)."
+                )
+                if normalize_lang(self.language) == "en"
+                else (
+                    f"主题建议长度约 {THEME_RECOMMENDED_MIN_CHARS}–"
+                    f"{THEME_RECOMMENDED_MAX_CHARS} 字"
+                    "（一个短语或一两句话）。"
+                )
             ),
         }
 
@@ -390,14 +433,18 @@ def _ensure_min_cast(
         [
             ("Elena Voss", "supporting", "A sharp-eyed bystander who knows a secret about the goal."),
             ("Marcus Quinn", "supporting", "An opportunistic contact who sells information for favors."),
-            ("Ivy Chen", "competitor", "A rival chasing the same prize as the player."),
+            (
+                "Ivy Chen",
+                "competitor",
+                "Opposes the player's aim — rival prize, direct resistance, or a contradicting goal.",
+            ),
             ("Noah Drake", "goal_person", "The person the player most needs to reach."),
         ]
         if en
         else [
             ("周晚星", "supporting", "知情的旁观者，掌握与目标有关的一条线索。"),
             ("沈渡", "supporting", "游走两头的中间人，爱用人情交换情报。"),
-            ("韩弈", "competitor", "与玩家争夺同一目标的对手。"),
+            ("韩弈", "competitor", "反对或阻挠玩家目标的对手，也可能追求与玩家矛盾的目标。"),
             ("苏念", "goal_person", "与玩家目标直接相关的关键人物。"),
         ]
     )
@@ -447,6 +494,29 @@ def _ensure_min_cast(
     return out[:5]
 
 
+def _parse_attitudes(raw: Any, *, known_names: list[str]) -> dict[str, str]:
+    """Keep attitude map entries that look like short takes on known people."""
+    if not isinstance(raw, dict):
+        return {}
+    allow = {n.strip() for n in known_names if (n or "").strip()}
+    allow.add(PLAYER_KEY)
+    allow.add("玩家")
+    out: dict[str, str] = {}
+    for key, val in raw.items():
+        who = str(key or "").strip()
+        take = str(val or "").strip()
+        if not who or not take:
+            continue
+        # Prefer exact roster names; still keep freeform keys if model used aliases.
+        if who in allow or who in {"Player", "玩家"} or any(
+            who == n or n in who or who in n for n in allow
+        ):
+            if who in {"玩家"}:
+                who = PLAYER_KEY
+            out[who] = take
+    return out
+
+
 def enrich_character_persona(
     model,
     tokenizer,
@@ -455,10 +525,32 @@ def enrich_character_persona(
     *,
     theme: str = "",
     language: str = "zh",
+    cast: list[CharacterCard] | None = None,
+    player: dict[str, str] | None = None,
 ) -> CharacterCard:
-    """Second-pass model: detailed persona from role + story background."""
+    """Second-pass model: persona + stance + attitudes toward the rest of the cast."""
     lang = normalize_lang(language)
     p = story_prompts(lang)
+    others = [c for c in (cast or []) if c.name != card.name]
+    other_lines = [
+        f"- {c.name} ({c.slot}): {c.description}" for c in others
+    ]
+    player = player or {}
+    player_name = str(player.get("name") or "").strip() or (
+        "Player" if lang == "en" else "玩家"
+    )
+    player_line = (
+        f"- Player (in-story name {player_name}): "
+        f"{player.get('identity') or ''} / goal: {player.get('goal') or ''}"
+        if lang == "en"
+        else (
+            f"- Player（剧中名 {player_name}）："
+            f"{player.get('identity') or ''} / 目标：{player.get('goal') or ''}"
+        )
+    )
+    roster = "\n".join([player_line] + other_lines) if other_lines or player else "(none)"
+    known_names = [c.name for c in others] + [PLAYER_KEY, player_name]
+
     if lang == "en":
         theme_block = f"Story theme: {theme.strip()}\n\n" if theme.strip() else ""
         user = (
@@ -466,8 +558,11 @@ def enrich_character_persona(
             f"Story background:\n{background}\n\n"
             f"Character name: {card.name}\n"
             f"Plot slot: {card.slot}\n"
-            f"Plot description: {card.description}\n"
-            "Generate the detailed persona JSON for this character."
+            f"Plot description: {card.description}\n\n"
+            f"Other people they may know (or not yet):\n{roster}\n\n"
+            "Generate the detailed persona JSON, including goals/supports/disapproves "
+            "and attitudes toward each listed person (or \"does not know them yet\"). "
+            f"Honor slot={card.slot}: keep dramatic friction against the player's goal."
         )
     else:
         theme_block = f"故事主题：{theme.strip()}\n\n" if theme.strip() else ""
@@ -476,10 +571,13 @@ def enrich_character_persona(
             f"故事背景：\n{background}\n\n"
             f"角色名：{card.name}\n"
             f"剧情槽位：{card.slot}\n"
-            f"剧情描述：{card.description}\n"
-            "请生成该角色的详细人设 JSON。"
+            f"剧情描述：{card.description}\n\n"
+            f"其余可能认识的人（也可能还不认识）：\n{roster}\n\n"
+            "请生成详细人设 JSON，必须含 goals/supports/disapproves，"
+            "以及对名单中每个人的 attitudes（不认识就写还不认识）。"
+            f"请遵守槽位 {card.slot}：对人设保留对玩家目标的戏剧阻力。"
         )
-    obj = _generate_json(model, tokenizer, p["persona_gen"], user, 384) or {}
+    obj = _generate_json(model, tokenizer, p["persona_gen"], user, 512) or {}
     profile = {
         "personality": str(obj.get("personality") or "").strip(),
         "speech_style": str(obj.get("speech_style") or "").strip(),
@@ -493,6 +591,10 @@ def enrich_character_persona(
         "motivation": str(obj.get("motivation") or "").strip(),
         "quirks": str(obj.get("quirks") or "").strip(),
         "summary": str(obj.get("summary") or "").strip(),
+        "goals": str(obj.get("goals") or "").strip(),
+        "supports": str(obj.get("supports") or "").strip(),
+        "disapproves": str(obj.get("disapproves") or "").strip(),
+        "attitudes": _parse_attitudes(obj.get("attitudes"), known_names=known_names),
     }
     card.persona_profile = profile
     card.persona = profile.get("summary") or card.persona or card.description[:80]
@@ -513,29 +615,35 @@ def generate_story_setup(
         user = (
             "Generate an English text-adventure opening setup. "
             "characters MUST list 4 or 5 NPCs: exactly 1 competitor, "
-            "exactly 1 goal_person, and 2–3 supporting. Unique names."
+            "exactly 1 goal_person, and 2–3 supporting. Unique names. "
+            "Bake in real resistance: the goal must be hard — personal pushback from "
+            "goal_person and/or external pressure from competitor/supporting. "
+            "No soft everyone-helps-the-player opening."
         )
         if theme_s:
             user += (
                 f"\n\n[REQUIRED THEME]\n{theme_s}\n"
-                "Build background, cast, and player goal around this theme so it is unmistakable."
+                "Build background, cast, and player goal around this theme so it is unmistakable. "
+                "Friction and obstacles should fit the theme."
             )
         else:
-            user += "\n(No theme given — invent a vivid original setting.)"
+            user += "\n(No theme given — invent a vivid original setting with clear obstacles.)"
     else:
         user = (
             "请生成一个中文文字冒险开场设定。"
             "characters 必须有 4 或 5 个 NPC：恰好 1 个 competitor、"
             "恰好 1 个 goal_person，以及 2～3 个 supporting；名字互不重复。"
+            "必须埋下实质阻力：玩家目标要难达成——goal_person 自身的抗拒/距离，"
+            "以及 competitor/supporting 带来的外部压力；不要写成众人配合的轻松开局。"
         )
         if theme_s:
             user += (
                 f"\n\n【必须遵守的主题】\n{theme_s}\n"
                 "请围绕以上主题构建 background、人物与玩家目标；"
-                "设定读起来应能立刻认出这个主题。"
+                "设定读起来应能立刻认出这个主题；阻力也要贴合该主题。"
             )
         else:
-            user += "\n（用户未指定主题，可自由发挥一个鲜明设定。）"
+            user += "\n（用户未指定主题，可自由发挥一个鲜明、有障碍的设定。）"
 
     last_err: Exception | None = None
     obj: dict | None = None
@@ -577,6 +685,8 @@ def generate_story_setup(
                     card,
                     theme=theme_s,
                     language=lang,
+                    cast=cards,
+                    player=player,
                 )
             )
         except Exception as e:
@@ -695,31 +805,56 @@ def format_scene_log(
         speaker = entry.get("speaker") or "?"
         to = entry.get("to") or []
         text = (entry.get("text") or "").strip()
-        if not text:
+        action = (entry.get("action") or "").strip()
+        if not text and not action:
             continue
         if kind == "narrator" or speaker == NARRATOR_KEY:
             lines.append(f"[{p['label_narrator']}] {text}")
         else:
             to_s = (", ".join(to) if en else "、".join(to)) if to else p["label_none"]
-            lines.append(f"[{speaker} → {to_s}] {text}")
+            act_label = p.get("label_action") or ("Action" if en else "动作")
+            if action and text:
+                lines.append(f"[{speaker} → {to_s}] ({act_label}: {action}) {text}")
+            elif action:
+                lines.append(f"[{speaker} → {to_s}] ({act_label}: {action})")
+            else:
+                lines.append(f"[{speaker} → {to_s}] {text}")
     return "\n".join(lines) if lines else p["label_no_dialogue"]
+
+
+def scene_entries(
+    state: StoryState, *, scene_index: int | None = None
+) -> list[dict[str, Any]]:
+    """Log lines for one scene (default: current). Older scenes stay in memory only."""
+    idx = state.scene_index if scene_index is None else scene_index
+    return [
+        e for e in state.scene_log if int(e.get("scene_index") or idx) == int(idx)
+    ]
+
+
+def last_log_was_narrator(state: StoryState) -> bool:
+    entries = scene_entries(state)
+    if not entries:
+        return False
+    last = entries[-1]
+    return (last.get("kind") == "narrator") or (last.get("speaker") == NARRATOR_KEY)
 
 
 def prior_dialogue_block(state: StoryState, *, limit: int = 40) -> str:
     """
-    Everything already spoken before the current speaker's turn.
-    (Lines are appended only after generation, so scene_log is always 'before now'.)
+    Direct short-term scene knowledge (current scene only).
+    Not long-term memory — past scenes belong in retrieved personal memories.
     """
     lang = normalize_lang(state.language)
-    body = format_scene_log(state.scene_log, limit, language=lang)
+    body = format_scene_log(scene_entries(state), limit, language=lang)
     if lang == "en":
         return (
-            "Messages you have already heard in this scene "
-            "(stay in continuity; answer what was just said when relevant):\n"
+            "Scene messages (direct knowledge this scene only — NOT long-term memory; "
+            "earlier scenes come from personal memories if recalled):\n"
             f"{body}"
         )
     return (
-        "你已经听到的本场对白/旁白（请承接上文，相关时要回应刚才的话）：\n"
+        "本幕场面消息（本幕直接听到的内容，不是长期记忆；更早的幕靠个人记忆检索）：\n"
         f"{body}"
     )
 
@@ -793,7 +928,10 @@ def compose_narrator_continue(state: StoryState) -> tuple[str, str, dict[str, An
             f"Background summary:\n{state.background[:500]}\n\n"
             f"{_present_block(state)}"
             f"Current narration:\n{state.current_narration or none}\n\n"
-            f"Recent scene:\n{format_scene_log(state.scene_log, language=lang)}\n"
+            f"This scene so far:\n"
+            f"{format_scene_log(scene_entries(state), language=lang)}\n\n"
+            "Write a mid-scene stage beat now (small action/shift, same scene — "
+            "walk, eat, shove, punch, etc.). Not a new scene."
         )
     else:
         user = (
@@ -801,7 +939,9 @@ def compose_narrator_continue(state: StoryState) -> tuple[str, str, dict[str, An
             f"背景摘要：\n{state.background[:500]}\n\n"
             f"{_present_block(state)}"
             f"当前旁白：\n{state.current_narration or none}\n\n"
-            f"最近场景：\n{format_scene_log(state.scene_log, language=lang)}\n"
+            f"本幕迄今：\n"
+            f"{format_scene_log(scene_entries(state), language=lang)}\n\n"
+            "现在写一句本幕内的小动作/场面推移（走路、吃饭、推搡、打了一拳等），不要开新幕。"
         )
     debug = {
         "kind": "narrator_continue",
@@ -813,7 +953,7 @@ def compose_narrator_continue(state: StoryState) -> tuple[str, str, dict[str, An
         "present": list(state.present_names()),
         "persona": "",
         "memory": "",
-        "scene_log": format_scene_log(state.scene_log, language=lang),
+        "scene_log": format_scene_log(scene_entries(state), language=lang),
         "narration": state.current_narration or none,
     }
     return system, user, debug
@@ -861,7 +1001,8 @@ def compose_narrator_bridge(state: StoryState) -> tuple[str, str, dict[str, Any]
             f"Player goal: {state.player.get('goal')}\n"
             f"Scene {prev} has ended; open scene {state.scene_index}.\n"
             f"{_present_block(state)}"
-            f"Previous scene log:\n{format_scene_log(state.scene_log, 30, language=lang)}"
+            f"Previous scene log:\n"
+            f"{format_scene_log(scene_entries(state, scene_index=prev), 30, language=lang)}"
         )
     else:
         user = (
@@ -870,7 +1011,8 @@ def compose_narrator_bridge(state: StoryState) -> tuple[str, str, dict[str, Any]
             f"玩家目标：{state.player.get('goal')}\n"
             f"第 {prev} 幕已结束，现在拉开第 {state.scene_index} 幕。\n"
             f"{_present_block(state)}"
-            f"上一幕记录：\n{format_scene_log(state.scene_log, 30, language=lang)}"
+            f"上一幕记录：\n"
+            f"{format_scene_log(scene_entries(state, scene_index=prev), 30, language=lang)}"
         )
     debug = {
         "kind": "narrator_bridge",
@@ -882,7 +1024,9 @@ def compose_narrator_bridge(state: StoryState) -> tuple[str, str, dict[str, Any]
         "present": list(state.present_names()),
         "persona": "",
         "memory": "",
-        "scene_log": format_scene_log(state.scene_log, 30, language=lang),
+        "scene_log": format_scene_log(
+            scene_entries(state, scene_index=prev), 30, language=lang
+        ),
         "narration": state.current_narration,
     }
     return system, user, debug
@@ -954,11 +1098,16 @@ def narrator_cue(model, tokenizer, state: StoryState) -> dict[str, Any]:
             + "\n\n"
             f"Scene {state.scene_index}/{state.max_scenes}.\n"
             f"Current narration:\n{state.current_narration or none}\n\n"
-            f"Recent scene:\n{format_scene_log(state.scene_log, language=lang)}\n"
+            f"This scene so far:\n"
+            f"{format_scene_log(scene_entries(state), language=lang)}\n"
         )
         user += (
             f"\nDialogue lines this scene (excluding narrator): {state.dialogue_count_in_scene}/"
             f"{state.scene_dialogue_min}~{state.scene_dialogue_max}."
+        )
+        user += (
+            "\nPlayer is a participant, not always the focus: NPCs may speak to each other; "
+            "Narrator may drop problems/situations on the cast."
         )
         dcount = state.dialogue_count_in_scene
         if dcount < PLAYER_CUE_AFTER_NPC_LINES:
@@ -966,8 +1115,16 @@ def narrator_cue(model, tokenizer, state: StoryState) -> dict[str, Any]:
                 f"\nOpening phase (first {PLAYER_CUE_AFTER_NPC_LINES} dialogue lines): "
                 "prefer present NPCs; do not pick Player."
             )
+        last_was_narrator = last_log_was_narrator(state)
+        if dcount < NARRATOR_ACTION_AFTER_DIALOGUE or last_was_narrator:
+            user += "\nDo not pick Narrator this turn (need more dialogue, or last beat was already Narrator)."
+        else:
+            user += (
+                "\nYou may pick Narrator for a mid-scene hitch/problem "
+                "(interrupt, side-task, third party, etc., same scene)."
+            )
         if dcount < state.scene_dialogue_min:
-            user += "\nBelow minimum dialogue; end_scene must be false; do not pick Narrator."
+            user += "\nBelow minimum dialogue; end_scene must be false."
         elif dcount >= state.scene_dialogue_max:
             user += "\nHit dialogue max; set end_scene=true."
     else:
@@ -980,19 +1137,29 @@ def narrator_cue(model, tokenizer, state: StoryState) -> dict[str, Any]:
             + "\n\n"
             f"第 {state.scene_index}/{state.max_scenes} 幕。\n"
             f"当前旁白：\n{state.current_narration or none}\n\n"
-            f"最近场景：\n{format_scene_log(state.scene_log, language=lang)}\n"
+            f"本幕迄今：\n"
+            f"{format_scene_log(scene_entries(state), language=lang)}\n"
         )
         dcount = state.dialogue_count_in_scene
         user += (
             f"\n本幕对白条数（不含旁白）：{dcount}/"
             f"{state.scene_dialogue_min}~{state.scene_dialogue_max}。"
         )
+        user += (
+            "\nPlayer 只是参与者之一，不必总是焦点：NPC 可互相对话；"
+            "Narrator 可给角色丢麻烦/处境。"
+        )
         if dcount < PLAYER_CUE_AFTER_NPC_LINES:
             user += (
                 f"\n开场阶段（前 {PLAYER_CUE_AFTER_NPC_LINES} 句对白）：请优先点出场 NPC，不要点 Player。"
             )
+        last_was_narrator = last_log_was_narrator(state)
+        if dcount < NARRATOR_ACTION_AFTER_DIALOGUE or last_was_narrator:
+            user += "\n本轮不要选 Narrator（对白还不够，或上一拍已是旁白）。"
+        else:
+            user += "\n可选 Narrator 抛出本幕小麻烦/处境（打断、岔事、第三者等，不换幕）。"
         if dcount < state.scene_dialogue_min:
-            user += "\n尚未达到最少对白条数，end_scene 必须为 false，且不要选 Narrator。"
+            user += "\n尚未达到最少对白条数，end_scene 必须为 false。"
         elif dcount >= state.scene_dialogue_max:
             user += "\n已达本幕对白上限，请设 end_scene=true。"
 
@@ -1012,7 +1179,13 @@ def narrator_cue(model, tokenizer, state: StoryState) -> dict[str, Any]:
                 return c
         return next(iter(state.character_dict.values()))
 
-    if resolved == NARRATOR_KEY and state.cast_names():
+    last_was_narrator = last_log_was_narrator(state)
+    allow_narrator_action = (
+        dcount >= NARRATOR_ACTION_AFTER_DIALOGUE
+        and not last_was_narrator
+        and dcount < state.scene_dialogue_max
+    )
+    if resolved == NARRATOR_KEY and not allow_narrator_action and state.cast_names():
         pick = _pick_present()
         resolved, card = pick.name, pick
         raw_speaker = f"{raw_speaker or 'Narrator'}→override:{pick.name}"
@@ -1039,10 +1212,15 @@ def narrator_cue(model, tokenizer, state: StoryState) -> dict[str, Any]:
     to = clamp_addressees(
         obj.get("to") if isinstance(obj.get("to"), list) else [],
         state,
-        allow_empty=False,
+        allow_empty=True,
     )
     allowed_to = set(present) | {PLAYER_KEY}
-    to = [n for n in to if n in allowed_to] or [PLAYER_KEY]
+    to = [n for n in to if n in allowed_to]
+    # Prefer NPC↔NPC when the model omitted addressees; don't always force Player.
+    if not to and resolved not in (PLAYER_KEY, NARRATOR_KEY):
+        to = [n for n in present if n != resolved][:1]
+    elif not to and resolved == PLAYER_KEY:
+        to = list(present[:1])
     return {
         "speaker": resolved,
         "raw_speaker": raw_speaker,
@@ -1062,12 +1240,16 @@ def build_character_user_prompt(
     memory_block: str,
     *,
     player_turn_mode: str | None = None,
+    allow_action: bool = False,
 ) -> str:
+    """
+    Turn-only user message: addressee, reaction, scene messages, recalled memories.
+    Persona lives in the system prompt — do not repeat acting_brief here.
+    """
     lang = normalize_lang(state.language)
     en = lang == "en"
     join = ", " if en else "、"
     to_s = join.join(to) if to else PLAYER_KEY
-    none = story_prompts(lang)["label_none"]
     reaction = ""
     if player_turn_mode == "interrupt":
         reaction = (
@@ -1092,33 +1274,41 @@ def build_character_user_prompt(
                 "请自然接话回应，语气像正常对话轮次，不要表现得像被打断。\n"
             )
         )
-    heard = prior_dialogue_block(state)
+    scene_messages = prior_dialogue_block(state)
+    mem = f"{memory_block}\n\n" if (memory_block or "").strip() else ""
+    if allow_action:
+        if en:
+            return (
+                f"Speaking as {card.name}. You are addressing: {to_s}\n"
+                f"{reaction}\n"
+                f"{scene_messages}\n\n"
+                f"{mem}"
+                "Using persona + scene messages + memories, output JSON with spoken line "
+                "and optional small action."
+            )
+        return (
+            f"以「{card.name}」行动。你正在对以下人：{to_s}\n"
+            f"{reaction}\n"
+            f"{scene_messages}\n\n"
+            f"{mem}"
+            "依据人设、场面消息与个人记忆，输出 JSON（台词 line + 可选小动作 action）。"
+        )
     if en:
         return (
-            f"Your name: {card.name}\n"
-            f"{card.acting_brief(lang)}\n"
-            f"You are speaking to: {to_s}\n"
+            f"Speaking as {card.name}. You are speaking to: {to_s}\n"
             f"{reaction}\n"
-            f"{_theme_prefix(state)}"
-            f"Story background summary:\n{state.background[:800]}\n\n"
-            f"Current narration:\n{state.current_narration or none}\n\n"
-            f"{heard}\n\n"
-            f"{memory_block}\n\n"
-            "You heard the lines above. Deliver this one line like a movie/TV character — "
-            "spoken dialogue only, in persona, continuing from what you just heard:"
+            f"{scene_messages}\n\n"
+            f"{mem}"
+            "Using your persona (system), the scene messages above, and any personal "
+            "memories above, speak one movie/TV line — dialogue only:"
         )
     return (
-        f"你的名字：{card.name}\n"
-        f"{card.acting_brief(lang)}\n"
-        f"你正在对以下人说话：{to_s}\n"
+        f"以「{card.name}」发言。你正在对以下人说话：{to_s}\n"
         f"{reaction}\n"
-        f"{_theme_prefix(state)}"
-        f"故事背景摘要：\n{state.background[:800]}\n\n"
-        f"当前旁白：\n{state.current_narration or none}\n\n"
-        f"{heard}\n\n"
-        f"{memory_block}\n\n"
-        "以上是你已经听到的内容。请严格按人设说这一句对白，承接上文，"
-        "口吻像电影/连续剧台词，只要说出口的话："
+        f"{scene_messages}\n\n"
+        f"{mem}"
+        "依据 system 人设、上方本幕场面消息与个人记忆，说一句电影/连续剧对白"
+        "（只要说出口的话）："
     )
 
 
@@ -1129,37 +1319,41 @@ def compose_character_line(
     recalled_hits: list[dict] | None = None,
     *,
     player_turn_mode: str | None = None,
+    allow_action: bool | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     lang = normalize_lang(state.language)
     p = story_prompts(lang)
-    memory_block = format_facts_for_prompt(recalled_hits or [])
+    persona = card.acting_brief(lang)
+    memory_block = format_facts_for_prompt(recalled_hits or [], max_facts=7)
+    scene_messages = prior_dialogue_block(state)
+    use_action = state.actions_enabled if allow_action is None else bool(allow_action)
     user = build_character_user_prompt(
         state,
         card,
         to,
         memory_block,
         player_turn_mode=player_turn_mode,
+        allow_action=use_action,
     )
     who = f"You are {card.name}." if lang == "en" else f"你就是「{card.name}」。"
-    system = p["character_line"] + f"\n{who}"
-    none = p["label_none"]
+    role_key = "character_line_action" if use_action else "character_line"
+    system = p[role_key] + f"\n{who}\n\n{persona}"
     debug = {
-        "kind": "character_line",
+        "kind": "character_line_action" if use_action else "character_line",
         "system": system,
         "user": user,
         "speaker": card.name,
         "slot": card.slot,
         "to": list(to),
         "player_turn_mode": player_turn_mode or "",
-        "persona": card.acting_brief(lang),
+        "actions_enabled": use_action,
+        "persona": persona,
         "persona_profile": dict(card.persona_profile or {}),
+        "scene_messages": scene_messages,
+        "personal_memory": memory_block,
         "memory": memory_block,
         "recalled": list(recalled_hits or []),
-        "background": state.background[:800],
-        "theme": state.theme,
-        "narration": state.current_narration or none,
-        "scene_log": format_scene_log(state.scene_log, language=lang),
-        "prior_dialogue": prior_dialogue_block(state),
+        "prior_dialogue": scene_messages,
         "present": list(state.present_names()),
     }
     return system, user, debug
@@ -1181,6 +1375,7 @@ def iter_character_line(
         to,
         recalled_hits=recalled_hits,
         player_turn_mode=player_turn_mode,
+        allow_action=False,
     )
     yield from iter_chat_text(
         model,
@@ -1201,12 +1396,14 @@ def prepare_character_line(
     *,
     player_turn_mode: str | None = None,
 ) -> tuple[dict[str, Any], Iterator[str]]:
+    """Dialogue-only stream path (actions off, or caller handles JSON separately)."""
     system, user, debug = compose_character_line(
         state,
         card,
         to,
         recalled_hits=recalled_hits,
         player_turn_mode=player_turn_mode,
+        allow_action=False,
     )
     return debug, iter_chat_text(
         model,
@@ -1240,6 +1437,139 @@ def generate_character_line(
     ).strip()
 
 
+def generate_character_beat(
+    model,
+    tokenizer,
+    state: StoryState,
+    card: CharacterCard,
+    to: list[str],
+    recalled_hits: list[dict] | None = None,
+    *,
+    player_turn_mode: str | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """
+    One NPC beat: spoken line + optional small action when actions_enabled.
+    Returns (line, action, debug).
+    """
+    if not state.actions_enabled:
+        system, user, debug = compose_character_line(
+            state,
+            card,
+            to,
+            recalled_hits=recalled_hits,
+            player_turn_mode=player_turn_mode,
+            allow_action=False,
+        )
+        line = "".join(
+            iter_chat_text(
+                model, tokenizer, system, user, CHARACTER_MAX_NEW_TOKENS
+            )
+        ).strip()
+        return line, "", debug
+
+    system, user, debug = compose_character_line(
+        state,
+        card,
+        to,
+        recalled_hits=recalled_hits,
+        player_turn_mode=player_turn_mode,
+        allow_action=True,
+    )
+    obj = _generate_json(
+        model, tokenizer, system, user, CHARACTER_MAX_NEW_TOKENS
+    ) or {}
+    line = str(obj.get("line") or obj.get("dialogue") or "").strip()
+    action = str(obj.get("action") or "").strip()
+    if not line and not action:
+        # Soft fallback: plain dialogue if JSON was empty/malformed.
+        line = generate_character_line(
+            model,
+            tokenizer,
+            state,
+            card,
+            to,
+            recalled_hits=recalled_hits,
+            player_turn_mode=player_turn_mode,
+        )
+    debug = {**debug, "parsed_line": line, "parsed_action": action}
+    return line, action, debug
+
+
+def validate_player_action(
+    model,
+    tokenizer,
+    state: StoryState,
+    action: str,
+) -> dict[str, Any]:
+    """Model check: reasonable + specific enough for a small stage action."""
+    action = (action or "").strip()
+    lang = normalize_lang(state.language)
+    en = lang == "en"
+    if not action:
+        return {
+            "ok": False,
+            "reason": "Empty action." if en else "动作为空。",
+            "hint": "Describe one small concrete move." if en else "写一个具体的小动作。",
+        }
+    if len(action) > 160:
+        return {
+            "ok": False,
+            "reason": "Action too long." if en else "动作写得太长。",
+            "hint": "Keep it to one short beat." if en else "缩成一句短动作。",
+        }
+    # Cheap reject for ultra-vague stubs before spending a model call.
+    vague = {
+        "do something",
+        "do stuff",
+        "act",
+        "something",
+        "anything",
+        "做点什么",
+        "随便",
+        "行动",
+        "搞他",
+        "搞定",
+    }
+    if action.lower() in vague or len(action) < 2:
+        return {
+            "ok": False,
+            "reason": "Too vague." if en else "太含糊。",
+            "hint": (
+                "Name a concrete gesture/step (e.g. set the cup down, step closer)."
+                if en
+                else "写具体姿态/走动（如：把杯子放下、往前一步）。"
+            ),
+        }
+    p = story_prompts(lang)
+    none = p["label_none"]
+    present = ", ".join(state.present_names()) if en else "、".join(state.present_names())
+    scene_so_far = format_scene_log(scene_entries(state), language=lang)
+    if en:
+        user = (
+            f"Background:\n{state.background}\n\n"
+            f"Present: {present or none}\n"
+            f"Player: {state.player.get('name')} — {state.player.get('identity')}\n\n"
+            f"This scene so far:\n{scene_so_far}\n\n"
+            f"Proposed player action:\n{action}\n"
+        )
+    else:
+        user = (
+            f"背景：\n{state.background}\n\n"
+            f"本幕出场：{present or none}\n"
+            f"玩家：{state.player.get('name')} — {state.player.get('identity')}\n\n"
+            f"本幕迄今：\n{scene_so_far}\n\n"
+            f"玩家拟做动作：\n{action}\n"
+        )
+    obj = _generate_json(model, tokenizer, p["action_check"], user, CUE_MAX_NEW_TOKENS) or {}
+    ok = bool(obj.get("ok"))
+    return {
+        "ok": ok,
+        "reason": str(obj.get("reason") or "").strip(),
+        "hint": str(obj.get("hint") or "").strip(),
+        "raw": obj,
+    }
+
+
 def append_log(
     state: StoryState,
     *,
@@ -1247,11 +1577,13 @@ def append_log(
     text: str,
     to: list[str] | None = None,
     kind: str = "dialogue",
+    action: str = "",
 ) -> dict[str, Any]:
     entry = {
         "speaker": speaker,
         "to": list(to or []),
         "text": (text or "").strip(),
+        "action": (action or "").strip(),
         "kind": kind,
         "scene_index": state.scene_index,
     }

@@ -35,8 +35,12 @@ const UI = {
     yourCued: '3. 你的台词（被点到 — 对方正常接话）',
     yourInterrupt: '3. 你的台词（打断 — 对方按被打断反应）',
     phCued: '导演点到你了 — 说出你的台词…',
-    phInterrupt: '可随时打断 — NPC 会按打断来反应…',
+    phInterrupt: '打断窗口已开 — 可发送；对方会按被打断反应…',
+    phCompose: '可先打字；台词播完后的短暂停顿里才能发送…',
     send: '发送',
+    sendClosed: '发送（等待打断窗口）',
+    sendOpenHint: ' · 可发送',
+    sendClosedHint: ' · 可打字，稍后再发送',
     needTo: '请至少勾选一个对话对象。',
     storyReady: '故事已生成。点「开始第一幕」进入旁白与调度。',
     scene: (s, max, n, lo, hi) => `第 ${s}/${max} 幕 · 对白 ${n}/${lo}~${hi}`,
@@ -56,14 +60,23 @@ const UI = {
     promptClose: '关闭',
     promptNone: '这条没有模型 prompt（玩家输入或系统消息）。',
     promptHint: '测试：点击旁白/角色台词查看 prompt',
-    promptSystem: 'System',
-    promptUser: 'User',
-    promptPersona: '人设',
+    promptSystem: 'System（角色指令 + 固定人设）',
+    promptUser: 'User（本轮：场面消息 + 检索记忆 + 发言任务）',
+    promptPersona: '人设（仅 system，不进长期记忆）',
+    promptSceneMessages: '本幕场面消息（短期直接知识，非记忆）',
+    promptPersonalMemory: '个人记忆（主观印象，嵌入检索约 6–7 条）',
     promptMemory: '记忆',
     promptBackground: '背景',
     promptNarration: '当前旁白',
     promptScene: '场景记录',
     promptKind: '类型',
+    actionsOn: '动作：开',
+    actionsOff: '动作：关',
+    actionsHint: '开启后角色/你可做小动作；你的动作会先过合理性检查。',
+    yourAction: '动作（可选）',
+    phAction: '写一个具体的小动作，例如：把杯子放下、往门口走一步…',
+    needLineOrAction: '请填写台词或动作（至少一项）。',
+    actionRejected: '动作未通过',
   },
   en: {
     title: 'AI Text Game',
@@ -96,8 +109,12 @@ const UI = {
     yourCued: '3. Your line (cued — they reply normally)',
     yourInterrupt: '3. Your line (interrupt — they react to being cut off)',
     phCued: 'Director pointed at you — say your line…',
-    phInterrupt: 'Interrupt anytime — NPCs react as interrupted…',
+    phInterrupt: 'Interrupt window open — send now; they react as interrupted…',
+    phCompose: 'You can type now; send unlocks in the short beat after each line…',
     send: 'Send',
+    sendClosed: 'Send (wait for interrupt window)',
+    sendOpenHint: ' · send open',
+    sendClosedHint: ' · type anytime, send after the beat',
     needTo: 'Select at least one character to speak to.',
     storyReady: 'Story generated. Click “Start scene 1” for narration and cues.',
     scene: (s, max, n, lo, hi) =>
@@ -118,14 +135,23 @@ const UI = {
     promptClose: 'Close',
     promptNone: 'No model prompt for this line (player input or system).',
     promptHint: 'Test: click narrator/NPC lines to inspect prompts',
-    promptSystem: 'System',
-    promptUser: 'User',
-    promptPersona: 'Persona',
+    promptSystem: 'System (role + fixed persona)',
+    promptUser: 'User (turn: scene messages + recalled memory + speak task)',
+    promptPersona: 'Persona (system only — not long-term memory)',
+    promptSceneMessages: 'Scene messages (direct this-scene knowledge, not memory)',
+    promptPersonalMemory: 'Personal memory (biased views; ~6–7 via embeddings)',
     promptMemory: 'Memory',
     promptBackground: 'Background',
     promptNarration: 'Narration',
     promptScene: 'Scene log',
     promptKind: 'Kind',
+    actionsOn: 'Actions: on',
+    actionsOff: 'Actions: off',
+    actionsHint: 'When on, cast/you can do small actions; yours are model-checked first.',
+    yourAction: 'Action (optional)',
+    phAction: 'One concrete beat, e.g. set the cup down, take a step toward the door…',
+    needLineOrAction: 'Enter a line and/or an action.',
+    actionRejected: 'Action rejected',
   },
 }
 
@@ -134,7 +160,14 @@ function PromptInspect({ prompt, t, onClose }) {
   const sections = [
     [t.promptKind, prompt.kind || '—'],
     [t.promptPersona, prompt.persona],
-    [t.promptMemory, prompt.memory],
+    [
+      t.promptSceneMessages,
+      prompt.scene_messages || prompt.prior_dialogue,
+    ],
+    [
+      t.promptPersonalMemory,
+      prompt.personal_memory || prompt.memory,
+    ],
     [t.promptBackground, prompt.background],
     [t.promptNarration, prompt.narration],
     [t.promptScene, prompt.scene_log],
@@ -167,6 +200,7 @@ function PromptInspect({ prompt, t, onClose }) {
 }
 
 function lineClass(ev) {
+  if (ev.type === 'action_rejected') return 'line system action-reject'
   if (ev.type === 'narrator' || ev.kind === 'narrator') return 'line narrator'
   if (ev.type === 'player' || ev.speaker === 'Player') return 'line player'
   if (ev.type === 'wait_player' || ev.type === 'system') return 'line system'
@@ -233,6 +267,9 @@ function formatEvent(ev, t, join) {
   if (ev.type === 'story_complete') {
     return ev.text || t.storyEnd
   }
+  if (ev.type === 'action_rejected') {
+    return ev.text || t.actionRejected
+  }
   const speaker = ev.speaker || '?'
   const to = (ev.to || []).join(join) || '?'
   const text = ev.text || ''
@@ -257,16 +294,32 @@ function formatEvent(ev, t, join) {
   return `${speaker} → ${to}${reactTag}: ${text}`
 }
 
+function FeedLineBody({ ev, t, join }) {
+  const action = (ev.action || '').trim()
+  const speech = formatEvent(ev, t, join)
+  const speechEmpty = !String(speech || '').trim()
+  return (
+    <>
+      {action ? <div className="action-box">{action}</div> : null}
+      {!speechEmpty ? <div className="line-speech">{speech}</div> : null}
+    </>
+  )
+}
+
 export default function StoryApp() {
   const [uiLang, setUiLang] = useState('zh')
   const [statusKind, setStatusKind] = useState('offline')
   const [loadError, setLoadError] = useState('')
   const [ready, setReady] = useState(false)
   const [busy, setBusy] = useState(false)
+  // Send only during the post-line interrupt beat or when cued; typing stays unlocked.
+  const [sendOpen, setSendOpen] = useState(false)
   const [theme, setTheme] = useState('')
   const [story, setStory] = useState(null)
   const [feed, setFeed] = useState([])
   const [input, setInput] = useState('')
+  const [actionInput, setActionInput] = useState('')
+  const [actionsEnabled, setActionsEnabled] = useState(false)
   const [selectedTo, setSelectedTo] = useState([])
   const [inspectPrompt, setInspectPrompt] = useState(null)
   const [apiLiveOk, setApiLiveOk] = useState(null)
@@ -288,9 +341,11 @@ export default function StoryApp() {
   const scheduleAutoContinue = useCallback(
     (seconds) => {
       clearAutoContinue()
-      const ms = Math.max(0.5, Number(seconds) || 0.75) * 1000
+      setSendOpen(true)
+      const ms = Math.max(0.5, Number(seconds) || 1.5) * 1000
       autoTimerRef.current = setTimeout(() => {
         autoTimerRef.current = null
+        setSendOpen(false)
         advanceRef.current?.()
       }, ms)
     },
@@ -321,6 +376,10 @@ export default function StoryApp() {
         _id: `${Date.now()}-${Math.random()}`,
       }
       setFeed((prev) => [...prev, ev])
+      if (ev.type === 'action_rejected') {
+        // Keep the compose window open after a failed action check.
+        setSendOpen(true)
+      }
       return
     }
     if (kind === 'stream_start' && msg.event) {
@@ -362,6 +421,7 @@ export default function StoryApp() {
 
   async function applyJobMessages(messages) {
     let finish = null
+    let actionRejected = false
     for (const msg of messages || []) {
       if (msg.type === 'error') {
         throw new Error(msg.message || 'Story job failed')
@@ -370,9 +430,12 @@ export default function StoryApp() {
         finish = msg
         continue
       }
+      if (msg.type === 'event' && msg.event?.type === 'action_rejected') {
+        actionRejected = true
+      }
       handleStreamMessage(msg)
     }
-    return finish
+    return { finish, actionRejected }
   }
 
   async function runLiveJob(startRes) {
@@ -384,6 +447,7 @@ export default function StoryApp() {
 
     const ctype = (startRes.headers.get('content-type') || '').toLowerCase()
     let finish = null
+    let actionRejected = false
 
     // New API: POST returns JSON {started:true}; poll /api/story/live every 0.25s.
     if (ctype.includes('application/json') || ctype.includes('text/json')) {
@@ -407,7 +471,8 @@ export default function StoryApp() {
         }
         since = live.next_since ?? since
         const part = await applyJobMessages(live.messages || [])
-        if (part) finish = part
+        if (part.actionRejected) actionRejected = true
+        if (part.finish) finish = part.finish
         if (finish) break
         if (!live.job_busy) break
         await sleep(LIVE_POLL_MS)
@@ -421,6 +486,9 @@ export default function StoryApp() {
         }
         if (msg?.type === 'error') {
           throw new Error(msg.message || 'Story job failed')
+        }
+        if (msg?.type === 'event' && msg.event?.type === 'action_rejected') {
+          actionRejected = true
         }
         handleStreamMessage(msg)
       })
@@ -438,8 +506,14 @@ export default function StoryApp() {
     }
 
     if (finish?.story) setStory(finish.story)
-    if (finish?.auto_continue) scheduleAutoContinue(finish.beat_seconds)
-    else clearAutoContinue()
+    if (finish?.auto_continue) {
+      scheduleAutoContinue(finish.beat_seconds)
+    } else {
+      clearAutoContinue()
+      const waiting =
+        !!finish?.waiting_for_player || !!finish?.story?.waiting_for_player
+      setSendOpen(waiting || actionRejected)
+    }
     return finish
   }
 
@@ -460,6 +534,11 @@ export default function StoryApp() {
               : 'choose',
       )
       if (data.story) setStory(data.story)
+      if (typeof data.actions_enabled === 'boolean') {
+        setActionsEnabled(data.actions_enabled)
+      } else if (typeof data.story?.actions_enabled === 'boolean') {
+        setActionsEnabled(data.story.actions_enabled)
+      }
       setApiLiveOk(data.live_feed === true)
     } catch {
       setReady(false)
@@ -467,6 +546,36 @@ export default function StoryApp() {
       setApiLiveOk(null)
     }
   }, [])
+
+  async function toggleActions() {
+    const next = !actionsEnabled
+    setActionsEnabled(next)
+    try {
+      const res = await fetch(`${API}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actions_enabled: next }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setActionsEnabled(!next)
+        pushEvents([
+          {
+            type: 'system',
+            text: typeof data.detail === 'string' ? data.detail : `Settings error ${res.status}`,
+          },
+        ])
+        return
+      }
+      if (typeof data.actions_enabled === 'boolean') {
+        setActionsEnabled(data.actions_enabled)
+      }
+      if (data.story) setStory(data.story)
+    } catch (e) {
+      setActionsEnabled(!next)
+      pushEvents([{ type: 'system', text: String(e.message || e) }])
+    }
+  }
 
   useEffect(() => {
     pollHealth()
@@ -479,13 +588,25 @@ export default function StoryApp() {
   }, [feed, busy])
 
   useEffect(() => {
-    if (!story?.suggested_to?.length) return
-    if (story.waiting_for_player) {
-      setSelectedTo(
-        story.suggested_to.filter((n) => (story.cast_names || []).includes(n)),
-      )
+    if (!story || story.story_complete) {
+      setSendOpen(false)
+      return
     }
-  }, [story?.waiting_for_player, story?.suggested_to, story?.cast_names])
+    if (story.waiting_for_player) {
+      setSendOpen(true)
+      if (story.suggested_to?.length) {
+        setSelectedTo(
+          story.suggested_to.filter((n) => (story.cast_names || []).includes(n)),
+        )
+      }
+    }
+  }, [
+    story,
+    story?.waiting_for_player,
+    story?.suggested_to,
+    story?.cast_names,
+    story?.story_complete,
+  ])
 
   async function pickModel(key) {
     setStatusKind('loading')
@@ -520,6 +641,7 @@ export default function StoryApp() {
   async function generateStory() {
     if (!ready || busy) return
     clearAutoContinue()
+    setSendOpen(false)
     setInspectPrompt(null)
     setBusy(true)
     setFeed([])
@@ -555,6 +677,7 @@ export default function StoryApp() {
   async function startIntro() {
     if (!ready || busy || !story) return
     clearAutoContinue()
+    setSendOpen(false)
     setBusy(true)
     try {
       const res = await fetch(`${API}/story/intro`, { method: 'POST' })
@@ -572,6 +695,7 @@ export default function StoryApp() {
     if (!ready || busy || !story || story.story_complete) return
     if (story.waiting_for_player) return
     clearAutoContinue()
+    setSendOpen(false)
     setBusy(true)
     try {
       const res = await fetch(`${API}/story/advance`, { method: 'POST' })
@@ -594,20 +718,29 @@ export default function StoryApp() {
 
   async function sendPlayer() {
     const message = input.trim()
-    if (!message || busy || !ready || !story || story.story_complete) return
+    const action = actionsEnabled ? actionInput.trim() : ''
+    if (!sendOpen || busy || !ready || !story || story.story_complete) {
+      return
+    }
+    if (!message && !action) {
+      pushEvents([{ type: 'system', text: t.needLineOrAction }])
+      return
+    }
     if (selectedTo.length === 0) {
       pushEvents([{ type: 'system', text: t.needTo }])
       return
     }
-    // Interrupt window: cancel the pending auto-cue and speak now.
+    // Interrupt / cued window: cancel the pending auto-cue and speak now.
     clearAutoContinue()
+    setSendOpen(false)
     setInput('')
+    setActionInput('')
     setBusy(true)
     try {
       const res = await fetch(`${API}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, to: selectedTo }),
+        body: JSON.stringify({ message, action, to: selectedTo }),
       })
       await runLiveJob(res)
     } catch (e) {
@@ -649,6 +782,9 @@ export default function StoryApp() {
               {statusKind === 'error' && (loadError || t.error)}
               {statusKind === 'ready' && (sceneLabel || t.ready)}
               {story?.waiting_for_player && t.cuedYou}
+              {story && !story.story_complete && !story.waiting_for_player && (
+                sendOpen ? t.sendOpenHint : t.sendClosedHint
+              )}
               {story?.story_complete && t.complete}
               {statusKind === 'ready' && apiLiveOk === false && (
                 <span className="api-warn">
@@ -658,25 +794,38 @@ export default function StoryApp() {
               )}
             </p>
           </div>
-          <div className="lang-toggle" role="group" aria-label="Language">
-            <button
-              type="button"
-              className={uiLang === 'zh' ? 'active' : ''}
-              disabled={busy}
-              onClick={() => setUiLang('zh')}
-              title="Story language for the next Generate"
-            >
-              中文
-            </button>
-            <button
-              type="button"
-              className={uiLang === 'en' ? 'active' : ''}
-              disabled={busy}
-              onClick={() => setUiLang('en')}
-              title="Story language for the next Generate"
-            >
-              EN
-            </button>
+          <div className="header-toggles">
+            <div className="lang-toggle" role="group" aria-label="Actions">
+              <button
+                type="button"
+                className={actionsEnabled ? 'active' : ''}
+                disabled={busy || statusKind === 'offline'}
+                onClick={toggleActions}
+                title={t.actionsHint}
+              >
+                {actionsEnabled ? t.actionsOn : t.actionsOff}
+              </button>
+            </div>
+            <div className="lang-toggle" role="group" aria-label="Language">
+              <button
+                type="button"
+                className={uiLang === 'zh' ? 'active' : ''}
+                disabled={busy}
+                onClick={() => setUiLang('zh')}
+                title="Story language for the next Generate"
+              >
+                中文
+              </button>
+              <button
+                type="button"
+                className={uiLang === 'en' ? 'active' : ''}
+                disabled={busy}
+                onClick={() => setUiLang('en')}
+                title="Story language for the next Generate"
+              >
+                EN
+              </button>
+            </div>
           </div>
         </div>
       </header>
@@ -816,9 +965,11 @@ export default function StoryApp() {
                       }
                     }}
                   >
-                    {ev.text && ev.type === 'system'
-                      ? ev.text
-                      : formatEvent(ev, t, join)}
+                    {ev.text && ev.type === 'system' ? (
+                      ev.text
+                    ) : (
+                      <FeedLineBody ev={ev} t={t} join={join} />
+                    )}
                   </div>
                 )
               })}
@@ -847,21 +998,52 @@ export default function StoryApp() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 rows={3}
-                placeholder={story.waiting_for_player ? t.phCued : t.phInterrupt}
-                disabled={busy}
+                placeholder={
+                  story.waiting_for_player
+                    ? t.phCued
+                    : sendOpen
+                      ? t.phInterrupt
+                      : t.phCompose
+                }
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
-                    sendPlayer()
+                    if (sendOpen && !busy) sendPlayer()
                   }
                 }}
               />
+              {actionsEnabled && (
+                <div className="action-composer">
+                  <label htmlFor="player-action">{t.yourAction}</label>
+                  <textarea
+                    id="player-action"
+                    className="action-input"
+                    value={actionInput}
+                    onChange={(e) => setActionInput(e.target.value)}
+                    rows={2}
+                    placeholder={t.phAction}
+                    maxLength={160}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault()
+                        if (sendOpen && !busy) sendPlayer()
+                      }
+                    }}
+                  />
+                  <p className="theme-hint">{t.actionsHint}</p>
+                </div>
+              )}
               <button
                 type="button"
-                disabled={busy || !input.trim() || selectedTo.length === 0}
+                disabled={
+                  !sendOpen ||
+                  busy ||
+                  selectedTo.length === 0 ||
+                  (!input.trim() && !(actionsEnabled && actionInput.trim()))
+                }
                 onClick={sendPlayer}
               >
-                {t.send}
+                {sendOpen ? t.send : t.sendClosed}
               </button>
             </section>
           )}

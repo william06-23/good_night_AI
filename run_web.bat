@@ -42,9 +42,26 @@ if not exist "node_modules\.bin\vite.cmd" (
   exit /b 1
 )
 
-REM Open the UI explicitly (vite --open is unreliable with some npm shims).
-start "" "http://127.0.0.1:5173/"
+REM Start Vite first (strictPort in vite.config — fails if 5173 is already taken).
+REM Open the browser only after the port answers, so we don't get a dead 5173 tab
+REM plus a second Vite on 5174.
+start "AI Text Game Vite" /D "%~dp0web" cmd /c "node_modules\.bin\vite.cmd --host 127.0.0.1 --port 5173"
 
-REM Call the local binary directly — some npm shims omit node_modules\.bin from PATH.
-call "node_modules\.bin\vite.cmd" --host 127.0.0.1 --port 5173
-if errorlevel 1 pause
+echo Waiting for Vite at http://127.0.0.1:5173 ...
+set /a _vtries=0
+:wait_vite
+set /a _vtries+=1
+powershell -NoProfile -Command "try { $r = Invoke-WebRequest -Uri 'http://127.0.0.1:5173/' -UseBasicParsing -TimeoutSec 2; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+if %ERRORLEVEL%==0 goto vite_ready
+if %_vtries% GEQ 30 (
+  echo Vite did not become ready on 5173. Close any old Vite window using that port and re-run.
+  pause
+  exit /b 1
+)
+timeout /t 1 /nobreak >nul
+goto wait_vite
+
+:vite_ready
+start "" "http://127.0.0.1:5173/"
+echo UI opened. Leave the "AI Text Game Vite" and "AI Text Game API" windows open.
+pause

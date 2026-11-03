@@ -20,18 +20,24 @@ from .chat_log import log_turn, new_session_id, start_session
 from .memory import (
     NARRATOR_KEY,
     PLAYER_KEY,
+    RETRIEVE_TOP_K,
     MemoryRetriever,
     add_memory,
     count_memories,
     ensure_character,
     extract_and_store,
+    extract_attitude_updates,
     is_speakable,
     list_speakable_characters,
     load_memory,
+    organize_memory,
     record_dialogue_beat,
+    record_present_scene_views,
     save_memory,
+    seed_attitude_memories,
     set_memory_language,
     set_speakable_characters,
+    upsert_attitude_memory,
     wipe_memory,
 )
 from .prompts import normalize_lang, story_prompts
@@ -41,6 +47,7 @@ from .story import (
     choose_present_cast,
     clamp_addressees,
     format_scene_log,
+    generate_character_beat,
     generate_story_setup,
     lookup_character,
     narrator_cue,
@@ -48,6 +55,8 @@ from .story import (
     prepare_narrator_bridge,
     prepare_narrator_continue,
     prepare_narrator_intro,
+    scene_entries,
+    validate_player_action,
 )
 
 # Weights live under models/ (or AI_TEXT_GAME_MODELS_DIR). Not committed to git.
@@ -55,7 +64,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Pause after a spoken/narrated line before the next cue or speaker.
 # Memory extract / light prep run during this window.
-LINE_BEAT_SECONDS = 0.75
+LINE_BEAT_SECONDS = 1.5
 
 
 def _resolve_models_dir() -> Path:
@@ -132,6 +141,8 @@ class TextGameEngine:
         # Testing: prompts used for each generated line (also embedded on events).
         self.prompt_log: list[dict[str, Any]] = []
         self.story: StoryState | None = None
+        # Experimental: small stage actions for NPCs + player (model-checked).
+        self.actions_enabled: bool = False
         # Live UI feed: background jobs publish here; client polls every ~0.25s.
         self._live_lock = threading.Lock()
         self._job_busy = False
@@ -286,10 +297,16 @@ class TextGameEngine:
             "history_turns": len(self.history),
             "mode": "story" if self.story is not None else "idle",
             "story": self.story.public_dict() if self.story else None,
+            "actions_enabled": bool(self.actions_enabled),
             # UI can detect a stale API process that predates live polling.
             "live_feed": True,
             "job_busy": bool(self._job_busy),
         }
+
+    def set_actions_enabled(self, enabled: bool) -> None:
+        self.actions_enabled = bool(enabled)
+        if self.story is not None:
+            self.story.actions_enabled = self.actions_enabled
 
     def get_memory(self) -> dict:
         return self.memory_store
@@ -369,19 +386,25 @@ class TextGameEngine:
         return self._start_live_job(worker, "story-advance")
 
     def begin_chat_job(
-        self, user_text: str, to: list[str] | None = None
+        self,
+        user_text: str,
+        to: list[str] | None = None,
+        action: str = "",
     ) -> dict[str, Any]:
         if not self.ready:
             raise RuntimeError("Engine not loaded")
         user_text = (user_text or "").strip()
-        if not user_text:
+        action = (action or "").strip()
+        if not user_text and not action:
             raise ValueError("Empty message")
+        if action and not self.actions_enabled:
+            raise ValueError("Actions are disabled — turn on Actions in settings")
         if self.story is None:
             raise RuntimeError("Generate a story first")
         targets = list(to or [])
 
         def worker() -> None:
-            for msg in self.chat_stream(user_text, to=targets):
+            for msg in self.chat_stream(user_text, to=targets, action=action):
                 self._publish_live(msg)
 
         return self._start_live_job(worker, "story-chat")
@@ -391,28 +414,35 @@ class TextGameEngine:
         user_text: str,
         character: str | None = None,
         to: list[str] | None = None,
+        action: str = "",
     ) -> dict[str, Any]:
         """Player line in the active story (cued or interrupt). Requires to[]."""
-        return self._collect_stream(self.chat_stream(user_text, character=character, to=to))
+        return self._collect_stream(
+            self.chat_stream(user_text, character=character, to=to, action=action)
+        )
 
     def chat_stream(
         self,
         user_text: str,
         character: str | None = None,
         to: list[str] | None = None,
+        action: str = "",
     ) -> Iterator[dict[str, Any]]:
         """SSE-friendly player turn: stream NPC reaction lines as they generate."""
         _ = character  # unused; roster comes from the story cast
         if not self.ready:
             raise RuntimeError("Engine not loaded")
         user_text = (user_text or "").strip()
-        if not user_text:
+        action = (action or "").strip()
+        if not user_text and not action:
             raise ValueError("Empty message")
         with self._lock:
             if self.story is None:
                 raise RuntimeError("Generate a story first")
             self._flush_followup()
-            yield from self._story_player_turn_stream(user_text, to or [])
+            yield from self._story_player_turn_stream(
+                user_text, to or [], action=action
+            )
         self._spawn_followup()
 
     @staticmethod
@@ -444,23 +474,52 @@ class TextGameEngine:
         ensure_character(self.memory_store, NARRATOR_KEY)
         ensure_character(self.memory_store, PLAYER_KEY)
 
-        seeds: list[tuple[str, str]] = [
-            (NARRATOR_KEY, f"故事背景：{state.background[:400]}"),
-            (
-                PLAYER_KEY,
-                f"我是{state.player.get('name')}，{state.player.get('identity')}。"
-                f"目标：{state.player.get('goal')}",
-            ),
-        ]
-        for card in state.character_dict.values():
-            seeds.append(
+        lang = normalize_lang(state.language)
+        # Seed short identity/stance lines only — full persona lives in the system prompt,
+        # not in long-term memory (avoids persona/memory overlap in the debug panel).
+        if lang == "en":
+            seeds: list[tuple[str, str]] = [
+                (NARRATOR_KEY, f"Story background: {state.background[:400]}"),
                 (
-                    card.name,
-                    f"{card.name}（{card.slot}）：{card.description}\n{card.acting_brief()}",
+                    PLAYER_KEY,
+                    f"I am {state.player.get('name')}, {state.player.get('identity')}. "
+                    f"Goal: {state.player.get('goal')}",
+                ),
+            ]
+            for card in state.character_dict.values():
+                seeds.append(
+                    (
+                        card.name,
+                        f"I am {card.name} ({card.slot}). In this story: {card.description}",
+                    )
                 )
-            )
+        else:
+            seeds = [
+                (NARRATOR_KEY, f"故事背景：{state.background[:400]}"),
+                (
+                    PLAYER_KEY,
+                    f"我是{state.player.get('name')}，{state.player.get('identity')}。"
+                    f"目标：{state.player.get('goal')}",
+                ),
+            ]
+            for card in state.character_dict.values():
+                seeds.append(
+                    (
+                        card.name,
+                        f"我是{card.name}（{card.slot}）。在本故事中：{card.description}",
+                    )
+                )
         for who, text in seeds:
             add_memory(self.memory_store, who, text)
+        for card in state.character_dict.values():
+            attitudes = (card.persona_profile or {}).get("attitudes") or {}
+            if isinstance(attitudes, dict) and attitudes:
+                seed_attitude_memories(
+                    self.memory_store,
+                    holder=card.name,
+                    attitudes={str(k): str(v) for k, v in attitudes.items()},
+                    retriever=None,  # rebuild once below
+                )
         save_memory(self.memory_store)
         if self.retriever is not None:
             self.retriever.rebuild(self.memory_store)
@@ -468,9 +527,9 @@ class TextGameEngine:
             self.active_character = names[0]
 
     def _recall_query(self, state: StoryState, fallback: str = "") -> str:
-        """Prefer recent heard dialogue so retrieval tracks the live conversation."""
+        """Prefer current-scene dialogue so retrieval can surface older-scene memories."""
         heard = format_scene_log(
-            state.scene_log, 16, language=state.language
+            scene_entries(state), 16, language=state.language
         ).strip()
         if heard and heard != story_prompts(state.language)["label_no_dialogue"]:
             return heard
@@ -479,6 +538,130 @@ class TextGameEngine:
             or (state.current_narration or "").strip()
             or state.background[:200]
         )
+
+    def _remember_narration(self, state: StoryState, text: str) -> None:
+        """Narrator LTM beat + queued biased scene impressions for present cast."""
+        record_dialogue_beat(
+            self.memory_store,
+            speaker=NARRATOR_KEY,
+            text=text,
+            retriever=self.retriever,
+        )
+        present = list(state.present_names())
+        narration = text
+
+        def _impressions() -> None:
+            briefs = {
+                name: (
+                    state.character_dict[name].acting_brief(state.language)
+                    if name in state.character_dict
+                    else ""
+                )
+                for name in present
+            }
+            record_present_scene_views(
+                self.model,
+                self.tokenizer,
+                self.memory_store,
+                narration=narration,
+                present_names=present,
+                retriever=self.retriever,
+                persona_briefs=briefs,
+            )
+
+        self._queue_followup(_impressions)
+
+    def _character_recall(
+        self, state: StoryState, card_name: str, fallback: str = ""
+    ) -> list[dict]:
+        """Embed-rank that character's personal memories; keep top ~6–7."""
+        if self.retriever is None:
+            return []
+        query = self._recall_query(state, fallback)
+        return self.retriever.retrieve(
+            query,
+            top_k=RETRIEVE_TOP_K,
+            characters=[card_name],
+        )
+
+    def _attitude_roster_lines(self, state: StoryState, holder: str) -> list[str]:
+        lines: list[str] = []
+        pname = str(state.player.get("name") or "").strip() or "Player"
+        lines.append(
+            f"- Player (in-story: {pname}): {state.player.get('identity') or ''} / "
+            f"{state.player.get('goal') or ''}"
+        )
+        for card in state.character_dict.values():
+            if card.name == holder:
+                continue
+            lines.append(f"- {card.name} ({card.slot}): {card.description}")
+        return lines
+
+    def _resolve_attitude_toward(self, state: StoryState, raw: str) -> str | None:
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        if raw in {PLAYER_KEY, "玩家", "Player", "player"}:
+            return PLAYER_KEY
+        card = lookup_character(state.character_dict, raw)
+        if card:
+            return card.name
+        # Exact cast / player-name match
+        if raw in state.character_dict:
+            return raw
+        pname = str(state.player.get("name") or "").strip()
+        if pname and raw == pname:
+            return PLAYER_KEY
+        return None
+
+    def _patch_card_attitude(
+        self, state: StoryState, holder: str, toward: str, attitude: str
+    ) -> None:
+        card = state.character_dict.get(holder)
+        if card is None:
+            return
+        prof = dict(card.persona_profile or {})
+        attitudes = dict(prof.get("attitudes") or {})
+        attitudes[toward] = attitude
+        prof["attitudes"] = attitudes
+        card.persona_profile = prof
+
+    def _refresh_attitudes_for(
+        self, state: StoryState, holder: str, recent_text: str
+    ) -> None:
+        """Extract attitude deltas; upsert LTM via same/contradict; patch persona map."""
+        holder = (holder or "").strip()
+        if not holder or not is_speakable(holder):
+            return
+        card = state.character_dict.get(holder)
+        current = dict((card.persona_profile or {}).get("attitudes") or {}) if card else {}
+        persona_brief = card.acting_brief(state.language) if card else ""
+        updates = extract_attitude_updates(
+            self.model,
+            self.tokenizer,
+            holder=holder,
+            current_attitudes=current,
+            roster_lines=self._attitude_roster_lines(state, holder),
+            recent_text=recent_text,
+        )
+        for item in updates:
+            toward = self._resolve_attitude_toward(state, item.get("toward") or "")
+            attitude = str(item.get("attitude") or "").strip()
+            if not toward or not attitude or toward == holder:
+                continue
+            result = upsert_attitude_memory(
+                self.model,
+                self.tokenizer,
+                self.memory_store,
+                holder=holder,
+                toward=toward,
+                attitude=attitude,
+                retriever=self.retriever,
+                stimulus_text=recent_text,
+                persona_brief=persona_brief,
+            )
+            if result in {"added", "replaced"}:
+                self._patch_card_attitude(state, holder, toward, attitude)
 
     def _remember_line(
         self,
@@ -491,30 +674,38 @@ class TextGameEngine:
         extract_assistant: str = "",
         history: list[dict] | None = None,
     ) -> None:
-        """Persist a beat immediately; richer multi-POV extract can follow."""
-        record_dialogue_beat(
-            self.memory_store,
-            speaker=speaker,
-            text=text,
-            to=to,
-            retriever=self.retriever,
-        )
+        """
+        Scene messages stay in the scene log (prompt block), not LTM.
+        Store biased impressions + selective attitude updates for the character.
+        """
+        _ = (speaker, to)  # transcript is already in scene_log / scene-messages block
         who = (extract_for or "").strip()
         if not who or not is_speakable(who):
             return
+        state = self.story
+        stimulus = (extract_user or text or "").strip()
+        assistant = (extract_assistant or "").strip()
 
         def _extract() -> None:
+            persona_brief = ""
+            if state is not None and who in state.character_dict:
+                persona_brief = state.character_dict[who].acting_brief(state.language)
             extract_and_store(
                 self.model,
                 self.tokenizer,
                 self.memory_store,
-                extract_user or text,
-                extract_assistant,
+                stimulus,
+                assistant,
                 retriever=self.retriever,
                 history=history or [],
                 character=who,
                 skip_gate=True,
+                character_only=True,
+                persona_brief=persona_brief,
             )
+            if state is not None:
+                blob = stimulus if not assistant else f"{stimulus}\n{assistant}"
+                self._refresh_attitudes_for(state, who, blob)
 
         self._queue_followup(_extract)
 
@@ -534,6 +725,7 @@ class TextGameEngine:
             state = generate_story_setup(
                 self.model, self.tokenizer, theme=theme, language=lang
             )
+            state.actions_enabled = self.actions_enabled
             self._seed_story_memories(state)
             self.story = state
             self.history = []
@@ -583,12 +775,7 @@ class TextGameEngine:
                     text = msg["event"].get("text") or ""
                 yield msg
             state.current_narration = text
-            record_dialogue_beat(
-                self.memory_store,
-                speaker=NARRATOR_KEY,
-                text=text,
-                retriever=self.retriever,
-            )
+            self._remember_narration(state, text)
             yield from self._emit_done(auto_continue=True)
         self._spawn_followup()
 
@@ -641,7 +828,19 @@ class TextGameEngine:
         """Defer memory/prep into the interrupt window (lock released after done)."""
         if work is None:
             return
-        self._pending_followup = work
+        prev = self._pending_followup
+        if prev is None:
+            self._pending_followup = work
+            return
+
+        def _chained() -> None:
+            try:
+                prev()
+            except Exception as e:
+                print(f"[engine] followup work failed: {e}")
+            work()
+
+        self._pending_followup = _chained
 
     def _flush_followup(self) -> None:
         work = self._pending_followup
@@ -673,16 +872,19 @@ class TextGameEngine:
         kind: str,
         chunks: Iterator[str],
         extra: dict[str, Any] | None = None,
+        action: str = "",
     ) -> Iterator[dict[str, Any]]:
         """Stream one spoken/narrated line; caller must append_log via stream_end text."""
         state = self.story
         assert state is not None
         extra = dict(extra or {})
+        action = (action or "").strip()
         draft = {
             "type": event_type,
             "speaker": speaker,
             "to": list(to),
             "text": "",
+            "action": action,
             "kind": kind,
             **extra,
         }
@@ -695,10 +897,76 @@ class TextGameEngine:
             yield {"type": "stream_delta", "delta": delta}
         text = "".join(parts).strip()
         entry = append_log(
-            state, speaker=speaker, text=text, to=to, kind=kind
+            state, speaker=speaker, text=text, to=to, kind=kind, action=action
         )
         full = {"type": event_type, **entry, **extra}
         yield {"type": "stream_end", "event": full}
+
+    def _emit_character_beat_unlocked(
+        self,
+        *,
+        card,
+        to: list[str],
+        hits: list[dict] | None = None,
+        player_turn_mode: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """NPC beat: stream dialogue, or JSON line+action when actions_enabled."""
+        state = self.story
+        assert state is not None
+        extra = dict(extra or {})
+        if state.actions_enabled:
+            line, action, dbg = generate_character_beat(
+                self.model,
+                self.tokenizer,
+                state,
+                card,
+                to,
+                recalled_hits=hits,
+                player_turn_mode=player_turn_mode,
+            )
+            recorded = self._record_prompt(dbg)
+
+            def _chunks() -> Iterator[str]:
+                if line:
+                    yield line
+
+            yield from self._stream_prose_unlocked(
+                event_type="dialogue",
+                speaker=card.name,
+                to=to,
+                kind="dialogue",
+                chunks=_chunks(),
+                action=action,
+                extra={
+                    **extra,
+                    "recalled": hits or [],
+                    "debug_prompt": recorded,
+                },
+            )
+            return
+
+        dbg, chunks = prepare_character_line(
+            self.model,
+            self.tokenizer,
+            state,
+            card,
+            to,
+            recalled_hits=hits,
+            player_turn_mode=player_turn_mode,
+        )
+        yield from self._stream_prose_unlocked(
+            event_type="dialogue",
+            speaker=card.name,
+            to=to,
+            kind="dialogue",
+            chunks=chunks,
+            extra={
+                **extra,
+                "recalled": hits or [],
+                "debug_prompt": self._record_prompt(dbg),
+            },
+        )
 
     def _queue_scene_end_if_needed(self, cue_end: bool) -> Iterator[dict[str, Any]]:
         """Mark bridge for next advance, or finish the story immediately."""
@@ -714,6 +982,25 @@ class TextGameEngine:
             allow = False
         if not allow:
             return
+        # Scene-end attitude pass for everyone who was present (same/contradict upsert).
+        present = list(state.present_names())
+        recent = format_scene_log(
+            scene_entries(state), 40, language=state.language
+        )
+
+        def _scene_attitudes_and_organize() -> None:
+            for who in present:
+                if is_speakable(who):
+                    self._refresh_attitudes_for(state, who, recent)
+            # Rizz-style: after the scene, resolve same/contradict by higher certainty.
+            organize_memory(
+                self.model,
+                self.tokenizer,
+                self.memory_store,
+                retriever=self.retriever,
+            )
+
+        self._queue_followup(_scene_attitudes_and_organize)
         if state.scene_index >= state.max_scenes:
             state.story_complete = True
             state.pending_scene_bridge = False
@@ -759,12 +1046,7 @@ class TextGameEngine:
                 text = msg["event"].get("text") or ""
             yield msg
         state.current_narration = text
-        record_dialogue_beat(
-            self.memory_store,
-            speaker=NARRATOR_KEY,
-            text=text,
-            retriever=self.retriever,
-        )
+        self._remember_narration(state, text)
 
     def _run_one_pending_reaction_unlocked(self) -> Iterator[dict[str, Any]]:
         state = self.story
@@ -778,45 +1060,29 @@ class TextGameEngine:
         card = lookup_character(state.character_dict, who)
         if card is None:
             return
-        query = self._recall_query(state, user_text)
-        hits = (
-            self.retriever.retrieve_for_turn(query, card.name)
-            if self.retriever
-            else []
-        )
+        hits = self._character_recall(state, card.name, user_text)
         line = ""
-        dbg, chunks = prepare_character_line(
-            self.model,
-            self.tokenizer,
-            state,
-            card,
-            [PLAYER_KEY],
-            recalled_hits=hits,
-            player_turn_mode=mode,
-        )
-        for msg in self._stream_prose_unlocked(
-            event_type="dialogue",
-            speaker=card.name,
+        action = ""
+        for msg in self._emit_character_beat_unlocked(
+            card=card,
             to=[PLAYER_KEY],
-            kind="dialogue",
-            chunks=chunks,
-            extra={
-                "player_mode": mode,
-                "recalled": hits,
-                "debug_prompt": self._record_prompt(dbg),
-            },
+            hits=hits,
+            player_turn_mode=mode,
+            extra={"player_mode": mode},
         ):
             if msg["type"] == "stream_end":
                 line = msg["event"].get("text") or ""
+                action = msg["event"].get("action") or ""
             yield msg
+        remember_text = line if line else f"*{(action or '').strip()}*"
         self.active_character = card.name
         self._remember_line(
             speaker=card.name,
-            text=line,
+            text=remember_text,
             to=[PLAYER_KEY],
             extract_for=card.name,
             extract_user=user_text,
-            extract_assistant=line,
+            extract_assistant=remember_text,
             history=self.history,
         )
         yield from self._queue_scene_end_if_needed(
@@ -874,12 +1140,7 @@ class TextGameEngine:
                     text = msg["event"].get("text") or ""
                 yield msg
             state.current_narration = text
-            record_dialogue_beat(
-                self.memory_store,
-                speaker=NARRATOR_KEY,
-                text=text,
-                retriever=self.retriever,
-            )
+            self._remember_narration(state, text)
             return
 
         card = lookup_character(state.character_dict, speaker)
@@ -901,38 +1162,27 @@ class TextGameEngine:
             return
 
         to = clamp_addressees(to, state)
-        query = self._recall_query(state)
-        hits: list[dict] = []
-        if self.retriever is not None:
-            hits = self.retriever.retrieve_for_turn(query, card.name)
+        hits = self._character_recall(state, card.name)
         line = ""
-        dbg, chunks = prepare_character_line(
-            self.model,
-            self.tokenizer,
-            state,
-            card,
-            to,
-            recalled_hits=hits,
-        )
-        for msg in self._stream_prose_unlocked(
-            event_type="dialogue",
-            speaker=card.name,
+        action = ""
+        for msg in self._emit_character_beat_unlocked(
+            card=card,
             to=to,
-            kind="dialogue",
-            chunks=chunks,
-            extra={"recalled": hits, "debug_prompt": self._record_prompt(dbg)},
+            hits=hits,
         ):
             if msg["type"] == "stream_end":
                 line = msg["event"].get("text") or ""
+                action = msg["event"].get("action") or ""
             yield msg
+        remember_text = line if line else f"*{(action or '').strip()}*"
         self.active_character = card.name
         self._remember_line(
             speaker=card.name,
-            text=line,
+            text=remember_text,
             to=to,
             extract_for=card.name,
-            extract_user=query,
-            extract_assistant=line,
+            extract_user=self._recall_query(state),
+            extract_assistant=remember_text,
         )
         yield from self._queue_scene_end_if_needed(
             state.dialogue_count_in_scene >= state.scene_dialogue_max
@@ -940,23 +1190,63 @@ class TextGameEngine:
         )
 
     def _story_player_turn_stream(
-        self, user_text: str, to: list[str]
+        self, user_text: str, to: list[str], *, action: str = ""
     ) -> Iterator[dict[str, Any]]:
         state = self.story
         assert state is not None
         if state.story_complete:
             raise RuntimeError("Story already complete")
 
+        user_text = (user_text or "").strip()
+        action = (action or "").strip()
+        if action and not state.actions_enabled:
+            raise ValueError("Actions are disabled")
+        if not user_text and not action:
+            raise ValueError("Empty message")
+
         addressees = clamp_addressees(to, state)
         npc_targets = [n for n in addressees if n in state.character_dict]
         if not npc_targets:
             raise ValueError("Select at least one character to speak to")
 
+        was_waiting = bool(state.waiting_for_player)
+        mode = "cued" if was_waiting else "interrupt"
+
+        if action:
+            check = validate_player_action(
+                self.model, self.tokenizer, state, action
+            )
+            if not check.get("ok"):
+                reason = str(check.get("reason") or "").strip()
+                hint = str(check.get("hint") or "").strip()
+                lang = normalize_lang(state.language)
+                if lang == "en":
+                    msg = f"Action rejected: {reason}"
+                    if hint:
+                        msg += f" Hint: {hint}"
+                else:
+                    msg = f"动作未通过：{reason}"
+                    if hint:
+                        msg += f" 提示：{hint}"
+                yield {
+                    "type": "event",
+                    "event": {
+                        "type": "action_rejected",
+                        "text": msg,
+                        "reason": reason,
+                        "hint": hint,
+                        "action": action,
+                    },
+                }
+                # Keep cued wait / interrupt window state unchanged.
+                state.waiting_for_player = was_waiting
+                yield from self._emit_done(auto_continue=False)
+                return
+
         # Interrupting cancels queued NPC reactions / bridge from the prior beat.
         state.pending_reactions = []
         state.pending_scene_bridge = False
 
-        mode = "cued" if state.waiting_for_player else "interrupt"
         state.last_player_mode = mode
         state.waiting_for_player = False
         entry = append_log(
@@ -965,10 +1255,18 @@ class TextGameEngine:
             text=user_text,
             to=npc_targets,
             kind="dialogue",
+            action=action if state.actions_enabled else "",
         )
         entry["player_mode"] = mode
-        log_turn(user_text, "", self.session_id)
-        self.history.append({"role": "user", "content": user_text})
+        stimulus = user_text
+        if action:
+            stimulus = (
+                f"[Player action: {action}] {user_text}".strip()
+                if user_text
+                else f"[Player action: {action}]"
+            )
+        log_turn(stimulus, "", self.session_id)
+        self.history.append({"role": "user", "content": stimulus})
 
         self.active_character = npc_targets[0]
         yield {
@@ -976,34 +1274,35 @@ class TextGameEngine:
             "event": {"type": "player", **entry, "player_mode": mode},
         }
 
-        # Player line is already in scene_log; store beat + enrich NPC memories.
-        record_dialogue_beat(
-            self.memory_store,
-            speaker=PLAYER_KEY,
-            text=user_text,
-            to=npc_targets,
-            retriever=self.retriever,
-        )
-
+        # Player line stays in scene_log (direct scene knowledge). NPCs only store
+        # biased personal impressions via extract — not a transcript copy.
         reactors = npc_targets[:2]
 
         def _player_memory() -> None:
             for who in npc_targets:
+                persona_brief = ""
+                if who in state.character_dict:
+                    persona_brief = state.character_dict[who].acting_brief(
+                        state.language
+                    )
                 extract_and_store(
                     self.model,
                     self.tokenizer,
                     self.memory_store,
-                    user_text,
+                    stimulus,
                     "",
                     retriever=self.retriever,
                     history=self.history,
                     character=who,
                     skip_gate=True,
+                    character_only=True,
+                    persona_brief=persona_brief,
                 )
+                self._refresh_attitudes_for(state, who, stimulus)
 
         self._queue_followup(_player_memory)
         state.pending_reactions = [
-            {"name": who, "mode": mode, "user_text": user_text}
+            {"name": who, "mode": mode, "user_text": stimulus}
             for who in reactors
             if state.dialogue_count_in_scene < state.scene_dialogue_max
         ]

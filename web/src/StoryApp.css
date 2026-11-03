@@ -108,6 +108,14 @@
   font-weight: 600;
 }
 
+.header-toggles {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+
 .lang-toggle {
   display: flex;
   gap: 0.25rem;
@@ -274,6 +282,48 @@ button:disabled {
   border: 1px solid #ccc;
   resize: vertical;
   font: inherit;
+}
+
+.action-composer {
+  margin: 0.25rem 0 0.65rem;
+  padding: 0.55rem 0.6rem;
+  border: 1px dashed #a89878;
+  background: #f3eee3;
+}
+
+.action-composer label {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #5a4a32;
+  margin-bottom: 0.25rem;
+}
+
+.action-composer .action-input {
+  margin: 0;
+  border-color: #c4b69a;
+  background: #fffcf6;
+}
+
+.action-box {
+  display: inline-block;
+  margin: 0 0 0.35rem;
+  padding: 0.2rem 0.45rem;
+  font-size: 0.8rem;
+  font-style: italic;
+  color: #5a4a32;
+  background: #efe6d4;
+  border: 1px solid #d2c4a8;
+}
+
+.line.action-reject {
+  border-left-color: #a33;
+  color: #8a3030;
+  background: #f8ecec;
+}
+
+.line-speech:empty {
+  display: none;
 }
 
 .checks {

@@ -1,6 +1,8 @@
 """
-Multi-perspective long-term memory: character-keyed string lists,
-importance gate, three POV rewriters, bge-m3 retrieval (CPU), organize.
+Multi-perspective long-term memory: character-keyed fact lists with certainty,
+importance gate, POV rewriters, bge-m3 retrieval (CPU), scene-end organize.
+Certainty (from Rizz-the-AI): evidence strength + context match + persona receptivity;
+on same/contradict, keep the higher-certainty entry.
 """
 
 from __future__ import annotations
@@ -8,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 
 import torch
@@ -27,7 +30,8 @@ def _resolve_models_dir() -> Path:
 _MODELS_DIR = _resolve_models_dir()
 EMBED_MODEL_ID = str(_MODELS_DIR / "bge-m3")
 EMBED_DEVICE = "cpu"
-RETRIEVE_TOP_K = 5
+# How many personal memory lines to inject into a character turn (embedding rank).
+RETRIEVE_TOP_K = 7
 RETRIEVE_MIN_SCORE = 0.25
 RETRIEVE_CANDIDATE_MULT = 3
 
@@ -36,6 +40,7 @@ NEAR_DUP_MIN = 0.88
 
 GATE_MAX_NEW_TOKENS = 64
 REWRITE_MAX_NEW_TOKENS = 192
+CERTAINTY_MAX_NEW_TOKENS = 64
 ORGANIZE_MAX_NEW_TOKENS = 96
 MAX_FACTS_PER_TURN = 5
 MEMORY_CONTEXT_MESSAGES = 5
@@ -109,6 +114,54 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", "", text.strip().lower())
 
 
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    try:
+        return max(lo, min(hi, float(x)))
+    except (TypeError, ValueError):
+        return lo
+
+
+def _entry_text(item: object) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        return str(item.get("text") or "").strip()
+    return ""
+
+
+def _entry_certainty(item: object) -> float:
+    if isinstance(item, dict):
+        return _clamp(item.get("certainty", 0.5))
+    return 0.5
+
+
+def _make_entry(
+    text: str, *, certainty: float = 0.5, session_new: bool = True
+) -> dict:
+    return {
+        "id": str(uuid.uuid4()),
+        "text": (text or "").strip(),
+        "certainty": _clamp(certainty),
+        "session_new": bool(session_new),
+    }
+
+
+def _normalize_entry(item: object) -> dict | None:
+    if isinstance(item, dict):
+        text = _entry_text(item)
+        if not text:
+            return None
+        out = dict(item)
+        out["text"] = text
+        out["id"] = str(out.get("id") or uuid.uuid4())
+        out["certainty"] = _clamp(out.get("certainty", 0.5))
+        out["session_new"] = bool(out.get("session_new", False))
+        return out
+    if isinstance(item, str) and item.strip():
+        return _make_entry(item.strip(), certainty=0.5, session_new=False)
+    return None
+
+
 def _empty_store() -> dict:
     store: dict = {
         NARRATOR_KEY: [],
@@ -119,26 +172,27 @@ def _empty_store() -> dict:
     return store
 
 
-def ensure_character(store: dict, name: str) -> list[str]:
+def ensure_character(store: dict, name: str) -> list:
+    """Return the character's fact-entry list (dicts with text + certainty)."""
     name = (name or "").strip()
     if not name or name.startswith("_"):
         raise ValueError("Invalid memory key")
     if not isinstance(store.get(name), list):
         store[name] = []
-    # Coerce entries to strings.
-    cleaned: list[str] = []
+    cleaned: list[dict] = []
     for item in store[name]:
-        if isinstance(item, str) and item.strip():
-            cleaned.append(item.strip())
-        elif isinstance(item, dict):
-            t = (item.get("text") or "").strip()
-            if t:
-                cleaned.append(t)
+        entry = _normalize_entry(item)
+        if entry is not None:
+            cleaned.append(entry)
     store[name] = cleaned
     return store[name]
 
 
 def character_memories(store: dict, name: str) -> list[str]:
+    return [_entry_text(e) for e in ensure_character(store, name)]
+
+
+def character_entries(store: dict, name: str) -> list[dict]:
     return list(ensure_character(store, name))
 
 
@@ -150,8 +204,9 @@ def iter_memories(store: dict):
         if not isinstance(values, list):
             continue
         for i, item in enumerate(values):
-            if isinstance(item, str) and item.strip():
-                yield key, i, item.strip()
+            text = _entry_text(item)
+            if text:
+                yield key, i, text
 
 
 def count_memories(store: dict) -> int:
@@ -159,19 +214,26 @@ def count_memories(store: dict) -> int:
 
 
 def public_memory_store(store: dict) -> dict:
-    """Copy suitable for JSON/API: no underscore keys; string lists only."""
-    out: dict[str, list[str]] = {}
+    """JSON/API copy: fact dicts with text + certainty (legacy strings upgraded)."""
+    out: dict[str, list] = {}
     for key, values in store.items():
         if not isinstance(key, str) or key.startswith("_"):
             continue
         if not isinstance(values, list):
             continue
-        out[key] = [
-            (x.strip() if isinstance(x, str) else str(x.get("text", "")).strip())
-            for x in values
-            if (isinstance(x, str) and x.strip())
-            or (isinstance(x, dict) and (x.get("text") or "").strip())
-        ]
+        bucket: list[dict] = []
+        for item in values:
+            entry = _normalize_entry(item)
+            if entry is not None:
+                bucket.append(
+                    {
+                        "id": entry["id"],
+                        "text": entry["text"],
+                        "certainty": entry["certainty"],
+                        "session_new": bool(entry.get("session_new", False)),
+                    }
+                )
+        out[key] = bucket
     for required in (NARRATOR_KEY, PLAYER_KEY):
         out.setdefault(required, [])
     for name in SPEAKABLE_CHARACTERS:
@@ -205,12 +267,18 @@ def _migrate_legacy(data: dict) -> dict:
                     store[key].append(item.strip())
                 elif isinstance(item, dict) and (item.get("text") or "").strip():
                     store[key].append(item["text"].strip())
-    seen = {_normalize(t) for t in store[NARRATOR_KEY]}
+    seen = {_normalize(_entry_text(t)) for t in store[NARRATOR_KEY]}
     for t in texts:
         n = _normalize(t)
         if n and n not in seen:
-            store[NARRATOR_KEY].append(t)
+            store[NARRATOR_KEY].append(
+                _make_entry(t, certainty=0.5, session_new=False)
+            )
             seen.add(n)
+    # Coerce any leftover string appends from the loop above.
+    for key in list(store.keys()):
+        if isinstance(store.get(key), list):
+            ensure_character(store, key)
     return store
 
 
@@ -235,10 +303,9 @@ def _normalize_store(data: dict) -> dict:
             ensure_character(store, key)
             store[key] = []
             for item in values:
-                if isinstance(item, str) and item.strip():
-                    store[key].append(item.strip())
-                elif isinstance(item, dict) and (item.get("text") or "").strip():
-                    store[key].append(item["text"].strip())
+                entry = _normalize_entry(item)
+                if entry is not None:
+                    store[key].append(entry)
     return store
 
 
@@ -298,30 +365,37 @@ def mark_session_new(store: dict, character: str, text: str) -> None:
     bucket = m.setdefault(character, [])
     if text not in bucket:
         bucket.append(text)
+    # Also flag the matching fact entry when present.
+    for entry in ensure_character(store, character):
+        if _normalize(_entry_text(entry)) == _normalize(text):
+            entry["session_new"] = True
 
 
-def format_facts_for_prompt(hits: list[dict] | list[str], max_facts: int = 40) -> str:
-    """Labeled memory block for the system prompt."""
+def format_facts_for_prompt(hits: list[dict] | list[str], max_facts: int = 7) -> str:
+    """
+    Personal biased-memory block for a character turn.
+    Not the same as scene messages — those are short-term direct knowledge.
+    """
     if not hits:
         return ""
-    by_who: dict[str, list[str]] = {}
-    for h in hits[-max_facts:]:
+    lines_out: list[str] = []
+    for h in hits[:max_facts]:
         if isinstance(h, dict):
             text = (h.get("text") or "").strip()
-            who = (h.get("character") or "Memory").strip() or "Memory"
         else:
             text = str(h).strip()
-            who = "Memory"
         if text:
-            by_who.setdefault(who, []).append(text)
-    if not by_who:
+            lines_out.append(f"- {text}")
+    if not lines_out:
         return ""
-    lines = ["已知长期记忆（按视角分组；聊天时可自然用到，不要逐条念出来）："]
-    for who, texts in by_who.items():
-        lines.append(f"【{who}】")
-        for t in texts:
-            lines.append(f"- {t}")
-    return "\n".join(lines)
+    if _ACTIVE_LANGUAGE == "en":
+        header = (
+            "Personal memories (biased takes you formed earlier — not a transcript; "
+            "use naturally, do not recite):"
+        )
+    else:
+        header = "个人记忆（你先前形成的主观看法/印象，不是逐字记录；可自然用到，不要照念）："
+    return header + "\n" + "\n".join(lines_out)
 
 
 def memory_id(character: str, index: int) -> str:
@@ -494,15 +568,391 @@ def find_string_duplicate(store: dict, character: str, fact_text: str) -> int | 
     return None
 
 
-def add_memory(store: dict, character: str, text: str) -> tuple[str, int] | None:
-    """Append a string memory. Returns (text, index) or None."""
+def score_evidence(
+    model, tokenizer, stimulus_text: str, fact_text: str
+) -> float:
+    """How strongly the stimulus asserts this memory (0–1)."""
+    mp = _memory_prompt_pack()
+    if _ACTIVE_LANGUAGE == "en":
+        blob = f"Stimulus:\n{stimulus_text}\n\nCandidate memory:\n{fact_text}"
+    else:
+        blob = f"刺激文本：\n{stimulus_text}\n\n待记内容：\n{fact_text}"
+    obj = _generate_json(
+        model, tokenizer, mp["evidence_score"], blob, CERTAINTY_MAX_NEW_TOKENS
+    )
+    if not obj:
+        return 0.35
+    try:
+        return _clamp(float(obj.get("evidence")))
+    except (TypeError, ValueError):
+        return 0.35
+
+
+def score_context_match(
+    fact_text: str,
+    recalled_hits: list[dict] | None,
+    retriever: MemoryRetriever | None,
+) -> float:
+    """How well the new fact aligns with recalled long-term context (0–1)."""
+    if not recalled_hits:
+        return 0.3
+    if retriever is None:
+        scores = [float(h.get("score", 0)) for h in recalled_hits]
+        return _clamp(sum(scores) / len(scores)) if scores else 0.3
+    q = retriever.encode_one(fact_text)
+    if q is None:
+        return 0.3
+    sims: list[float] = []
+    for h in recalled_hits:
+        t = (h.get("text") or "").strip()
+        if not t:
+            continue
+        e = retriever.encode_one(t)
+        if e is None:
+            continue
+        sims.append(float((q @ e.T).item()))
+    if not sims:
+        return 0.3
+    return _clamp(sum(sims) / len(sims))
+
+
+def score_persona_receptivity(
+    model, tokenizer, persona_brief: str, fact_text: str
+) -> float:
+    """
+    How readily this persona would internalize the impression (0–1).
+    Gullible / desire-aligned → higher; skeptical / value-clash → lower.
+    """
+    persona_brief = (persona_brief or "").strip()
+    if not persona_brief:
+        return 0.45
+    mp = _memory_prompt_pack()
+    if _ACTIVE_LANGUAGE == "en":
+        blob = f"Persona:\n{persona_brief}\n\nCandidate memory:\n{fact_text}"
+    else:
+        blob = f"人设：\n{persona_brief}\n\n待记内容：\n{fact_text}"
+    obj = _generate_json(
+        model, tokenizer, mp["persona_receptivity"], blob, CERTAINTY_MAX_NEW_TOKENS
+    )
+    if not obj:
+        return 0.45
+    try:
+        return _clamp(float(obj.get("receptivity")))
+    except (TypeError, ValueError):
+        return 0.45
+
+
+def compute_certainty(
+    model,
+    tokenizer,
+    stimulus_text: str,
+    fact_text: str,
+    *,
+    recalled_hits: list[dict] | None = None,
+    retriever: MemoryRetriever | None = None,
+    persona_brief: str = "",
+) -> float:
+    """
+    New memories: evidence + context match + persona receptivity.
+    certainty ≈ 0.05 + 0.25*evidence + 0.20*context + 0.25*persona  (≈0.05–0.75)
+    """
+    evidence = score_evidence(model, tokenizer, stimulus_text, fact_text)
+    context = score_context_match(fact_text, recalled_hits, retriever)
+    persona = score_persona_receptivity(model, tokenizer, persona_brief, fact_text)
+    certainty = _clamp(
+        0.05 + 0.25 * evidence + 0.20 * context + 0.25 * persona,
+        0.05,
+        0.75,
+    )
+    print(
+        f"[memory] certainty: evidence={evidence:.2f} context={context:.2f} "
+        f"persona={persona:.2f} -> {certainty:.2f}"
+    )
+    return certainty
+
+
+def bump_certainty(entry: dict, *, amount: float = 0.08) -> float:
+    old = _entry_certainty(entry)
+    new = _clamp(old + amount * (1.0 - old), 0.05, 0.99)
+    entry["certainty"] = new
+    entry["session_new"] = True
+    return new
+
+
+def add_memory(
+    store: dict,
+    character: str,
+    text: str,
+    *,
+    certainty: float = 0.5,
+    session_new: bool = True,
+) -> tuple[str, int] | None:
+    """Append a fact memory. Returns (text, index) or None."""
     text = (text or "").strip()
     if not text:
         return None
     bucket = ensure_character(store, character)
-    bucket.append(text)
+    entry = _make_entry(text, certainty=certainty, session_new=session_new)
+    bucket.append(entry)
     mark_session_new(store, character, text)
     return text, len(bucket) - 1
+
+
+# Tagged attitude lines: "[attitude:Wang Li] warm ally" — one slot per target.
+_ATTITUDE_RE = re.compile(
+    r"^\[attitude:(?P<toward>[^\]]+)\]\s*(?P<take>.+)$",
+    re.I | re.DOTALL,
+)
+
+
+def format_attitude_memory(toward: str, attitude: str) -> str:
+    toward = (toward or "").strip()
+    attitude = (attitude or "").strip()
+    if toward in {"玩家"}:
+        toward = PLAYER_KEY
+    return f"[attitude:{toward}] {attitude}"
+
+
+def parse_attitude_memory(text: str) -> tuple[str, str] | None:
+    m = _ATTITUDE_RE.match((text or "").strip())
+    if not m:
+        return None
+    toward = m.group("toward").strip()
+    take = m.group("take").strip()
+    if toward in {"玩家"}:
+        toward = PLAYER_KEY
+    if not toward or not take:
+        return None
+    return toward, take
+
+
+def find_attitude_index(store: dict, character: str, toward: str) -> int | None:
+    toward_n = _normalize(toward)
+    if toward_n in {_normalize("玩家"), _normalize(PLAYER_KEY)}:
+        toward_alts = {_normalize(PLAYER_KEY), _normalize("玩家")}
+    else:
+        toward_alts = {toward_n}
+    for i, text in enumerate(character_memories(store, character)):
+        parsed = parse_attitude_memory(text)
+        if parsed and _normalize(parsed[0]) in toward_alts:
+            return i
+    return None
+
+
+def replace_memory_at_index(
+    store: dict,
+    character: str,
+    index: int,
+    new_text: str,
+    path: Path = MEMORY_PATH,
+    retriever: MemoryRetriever | None = None,
+    *,
+    certainty: float | None = None,
+) -> str | None:
+    """Replace one fact in-place; rebuild retriever embeddings for that store."""
+    new_text = (new_text or "").strip()
+    bucket = ensure_character(store, character)
+    if index < 0 or index >= len(bucket) or not new_text:
+        return None
+    old = bucket[index]
+    c = (
+        _clamp(certainty)
+        if certainty is not None
+        else _entry_certainty(old)
+    )
+    bucket[index] = _make_entry(new_text, certainty=c, session_new=True)
+    mark_session_new(store, character, new_text)
+    save_memory(store, path)
+    if retriever is not None:
+        retriever.rebuild(store)
+    return new_text
+
+
+def upsert_attitude_memory(
+    model,
+    tokenizer,
+    store: dict,
+    *,
+    holder: str,
+    toward: str,
+    attitude: str,
+    path: Path = MEMORY_PATH,
+    retriever: MemoryRetriever | None = None,
+    stimulus_text: str = "",
+    persona_brief: str = "",
+    recalled_hits: list[dict] | None = None,
+) -> str:
+    """
+    Keep one attitude line per (holder → toward).
+    Conflicts resolve by higher certainty (Rizz-style), not “always prefer new”.
+    """
+    holder = (holder or "").strip()
+    toward = (toward or "").strip()
+    attitude = (attitude or "").strip()
+    if toward in {"玩家"}:
+        toward = PLAYER_KEY
+    if not holder or not toward or not attitude or not is_speakable(holder):
+        return "skipped"
+    line = format_attitude_memory(toward, attitude)
+    stimulus = (stimulus_text or line).strip()
+    new_c = compute_certainty(
+        model,
+        tokenizer,
+        stimulus,
+        line,
+        recalled_hits=recalled_hits,
+        retriever=retriever,
+        persona_brief=persona_brief,
+    )
+    idx = find_attitude_index(store, holder, toward)
+    if idx is None:
+        saved = _store_one_string(
+            store,
+            holder,
+            line,
+            path,
+            retriever,
+            certainty=new_c,
+            skip_scoring=True,
+        )
+        return "added" if saved else "skipped"
+
+    bucket = ensure_character(store, holder)
+    old_entry = bucket[idx]
+    old_text = _entry_text(old_entry)
+    old_parsed = parse_attitude_memory(old_text)
+    old_take = old_parsed[1] if old_parsed else old_text
+    old_c = _entry_certainty(old_entry)
+
+    if _normalize(old_take) == _normalize(attitude):
+        bump_certainty(old_entry, amount=0.06)
+        mark_session_new(store, holder, old_text)
+        save_memory(store, path)
+        return "kept"
+
+    rel = classify_relation(model, tokenizer, old_take, attitude)
+    if rel == "same":
+        bump_certainty(old_entry, amount=0.06)
+        mark_session_new(store, holder, old_text)
+        save_memory(store, path)
+        return "kept"
+
+    # contradict / unrelated about same target → keep higher certainty
+    if new_c > old_c or (abs(new_c - old_c) < 1e-6 and rel == "contradict"):
+        replaced = replace_memory_at_index(
+            store,
+            holder,
+            idx,
+            line,
+            path=path,
+            retriever=retriever,
+            certainty=new_c,
+        )
+        print(
+            f"[attitude] {holder} → {toward} ({rel}): "
+            f"keep new c={new_c:.2f} over old c={old_c:.2f}"
+        )
+        return "replaced" if replaced else "skipped"
+
+    bump_certainty(old_entry, amount=0.05)
+    mark_session_new(store, holder, old_text)
+    save_memory(store, path)
+    print(
+        f"[attitude] {holder} → {toward} ({rel}): "
+        f"keep old c={old_c:.2f} over new c={new_c:.2f}"
+    )
+    return "kept"
+
+
+def seed_attitude_memories(
+    store: dict,
+    *,
+    holder: str,
+    attitudes: dict[str, str],
+    path: Path = MEMORY_PATH,
+    retriever: MemoryRetriever | None = None,
+) -> int:
+    """Write initial persona attitudes into LTM at high baseline certainty."""
+    n = 0
+    for toward, take in (attitudes or {}).items():
+        toward = str(toward or "").strip()
+        take = str(take or "").strip()
+        if toward in {"玩家"}:
+            toward = PLAYER_KEY
+        if not toward or not take:
+            continue
+        if find_attitude_index(store, holder, toward) is not None:
+            continue
+        line = format_attitude_memory(toward, take)
+        if _store_one_string(
+            store,
+            holder,
+            line,
+            path,
+            retriever,
+            certainty=0.72,
+            skip_scoring=True,
+        ):
+            n += 1
+    return n
+
+
+def extract_attitude_updates(
+    model,
+    tokenizer,
+    *,
+    holder: str,
+    current_attitudes: dict[str, str],
+    roster_lines: list[str],
+    recent_text: str,
+) -> list[dict[str, str]]:
+    """Ask the model which attitudes changed; returns [{toward, attitude}, ...]."""
+    holder = (holder or "").strip()
+    recent_text = (recent_text or "").strip()
+    if not holder or not recent_text:
+        return []
+    mp = _memory_prompt_pack()
+    if _ACTIVE_LANGUAGE == "en":
+        cur = "\n".join(
+            f"- {k}: {v}" for k, v in (current_attitudes or {}).items()
+        ) or "(none yet)"
+        roster = "\n".join(roster_lines) or "(none)"
+        user = (
+            f"Character whose attitudes we update: {holder}\n"
+            f"Current attitudes:\n{cur}\n\n"
+            f"People they may refer to:\n{roster}\n\n"
+            f"Recent content:\n{recent_text}\n\n"
+            "List only meaningful attitude updates."
+        )
+    else:
+        cur = "\n".join(
+            f"- {k}：{v}" for k, v in (current_attitudes or {}).items()
+        ) or "（尚无）"
+        roster = "\n".join(roster_lines) or "（无）"
+        user = (
+            f"要更新态度的角色：{holder}\n"
+            f"当前态度：\n{cur}\n\n"
+            f"可能涉及的人物：\n{roster}\n\n"
+            f"近期内容：\n{recent_text}\n\n"
+            "只列出有实质变化的态度更新。"
+        )
+    obj = _generate_json(
+        model, tokenizer, mp["attitude_update"], user, REWRITE_MAX_NEW_TOKENS
+    ) or {}
+    raw = obj.get("updates")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        toward = str(item.get("toward") or "").strip()
+        attitude = str(item.get("attitude") or "").strip()
+        if toward in {"玩家"}:
+            toward = PLAYER_KEY
+        if toward and attitude:
+            out.append({"toward": toward, "attitude": attitude})
+    return out
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -680,8 +1130,16 @@ def _store_one_string(
     path: Path,
     retriever: MemoryRetriever | None,
     skip_norms: set[str] | None = None,
+    *,
+    certainty: float | None = None,
+    skip_scoring: bool = False,
+    stimulus_text: str = "",
+    persona_brief: str = "",
+    recalled_hits: list[dict] | None = None,
+    model=None,
+    tokenizer=None,
 ) -> str | None:
-    """Insert one string into a character bucket, or skip near/exact dup."""
+    """Insert one fact into a character bucket, or skip near/exact dup."""
     fact_text = (fact_text or "").strip()
     if not fact_text:
         return None
@@ -690,24 +1148,50 @@ def _store_one_string(
     if norm in skip_norms:
         return None
 
-    if find_string_duplicate(store, character, fact_text) is not None:
-        print(f"[memory] already known ({character}): {fact_text}")
+    dup_i = find_string_duplicate(store, character, fact_text)
+    if dup_i is not None:
+        entry = ensure_character(store, character)[dup_i]
+        bump_certainty(entry, amount=0.05)
+        mark_session_new(store, character, fact_text)
+        save_memory(store, path)
+        print(f"[memory] already known, bumped ({character}): {fact_text}")
         return None
 
     if retriever is not None:
         hit = retriever.best_match(fact_text, character=character, min_score=NEAR_DUP_MIN)
         if hit:
-            print(f"[memory] near-dup skip ({character}): {fact_text}")
+            parsed = parse_memory_id(hit.get("id") or "")
+            if parsed:
+                _, idx = parsed
+                bucket = ensure_character(store, character)
+                if 0 <= idx < len(bucket):
+                    bump_certainty(bucket[idx], amount=0.06)
+                    mark_session_new(store, character, _entry_text(bucket[idx]))
+                    save_memory(store, path)
+            print(f"[memory] near-dup bump ({character}): {fact_text}")
             return None
 
-    result = add_memory(store, character, fact_text)
+    if certainty is None and not skip_scoring and model is not None and tokenizer is not None:
+        certainty = compute_certainty(
+            model,
+            tokenizer,
+            stimulus_text or fact_text,
+            fact_text,
+            recalled_hits=recalled_hits,
+            retriever=retriever,
+            persona_brief=persona_brief,
+        )
+    if certainty is None:
+        certainty = 0.45
+
+    result = add_memory(store, character, fact_text, certainty=certainty)
     if result is None:
         return None
     text, index = result
     save_memory(store, path)
     if retriever is not None:
         retriever.add_memory_embedding(character, text, index)
-    print(f"[memory] saved ({character}): {text}")
+    print(f"[memory] saved ({character}, c={certainty:.2f}): {text}")
     return text
 
 
@@ -734,15 +1218,130 @@ def record_dialogue_beat(
         who = speaker
     else:
         return None
-    join = "、"
-    to_s = join.join(t for t in (to or []) if t) or "—"
+    en = _ACTIVE_LANGUAGE == "en"
+    join = ", " if en else "、"
+    to_s = join.join(t for t in (to or []) if t) or ("—" if en else "—")
     if speaker == NARRATOR_KEY:
-        beat = f"旁白：{text}"
+        beat = f"Narrator: {text}" if en else f"旁白：{text}"
     elif speaker == PLAYER_KEY:
-        beat = f"玩家对{to_s}说：{text}"
+        beat = (
+            f"Player said to {to_s}: {text}"
+            if en
+            else f"玩家对{to_s}说：{text}"
+        )
     else:
-        beat = f"{speaker}对{to_s}说：{text}"
+        beat = (
+            f"{speaker} said to {to_s}: {text}"
+            if en
+            else f"{speaker}对{to_s}说：{text}"
+        )
     return _store_one_string(store, who, beat, path, retriever)
+
+
+def store_character_impressions(
+    model,
+    tokenizer,
+    store: dict,
+    *,
+    character: str,
+    stimulus_text: str,
+    assistant_text: str = "",
+    history: list[dict] | None = None,
+    path: Path = MEMORY_PATH,
+    retriever: MemoryRetriever | None = None,
+    persona_brief: str = "",
+    recalled_hits: list[dict] | None = None,
+) -> list[str]:
+    """
+    Write first-person *biased* memory lines for one character.
+    Scene transcripts stay out of LTM — only subjective takeaways are stored.
+    """
+    character = (character or "").strip()
+    stimulus_text = (stimulus_text or "").strip()
+    if not character or not is_speakable(character) or not stimulus_text:
+        return []
+    facts = summarize_for_perspective(
+        model,
+        tokenizer,
+        character,
+        stimulus_text,
+        assistant_text,
+        history=history,
+        character=character,
+    )
+    saved: list[str] = []
+    norms: set[str] = set()
+    blob = stimulus_text if not assistant_text else f"{stimulus_text}\n{assistant_text}"
+    for fact in facts:
+        out = _store_one_string(
+            store,
+            character,
+            fact,
+            path,
+            retriever,
+            skip_norms=norms,
+            stimulus_text=blob,
+            persona_brief=persona_brief,
+            recalled_hits=recalled_hits,
+            model=model,
+            tokenizer=tokenizer,
+        )
+        if out is not None:
+            saved.append(out)
+            norms.add(_normalize(out))
+    return saved
+
+
+def record_present_scene_views(
+    model,
+    tokenizer,
+    store: dict,
+    *,
+    narration: str,
+    present_names: list[str],
+    path: Path = MEMORY_PATH,
+    retriever: MemoryRetriever | None = None,
+    persona_briefs: dict[str, str] | None = None,
+) -> None:
+    """Biased first-person scene impressions for each present NPC (not verbatim dump)."""
+    text = (narration or "").strip()
+    if not text:
+        return
+    persona_briefs = persona_briefs or {}
+    for raw in present_names or []:
+        name = (raw or "").strip()
+        if not name or not is_speakable(name):
+            continue
+        saved = store_character_impressions(
+            model,
+            tokenizer,
+            store,
+            character=name,
+            stimulus_text=text,
+            path=path,
+            retriever=retriever,
+            persona_brief=persona_briefs.get(name, ""),
+        )
+        if saved:
+            continue
+        # Fallback if the rewrite returns nothing.
+        en = _ACTIVE_LANGUAGE == "en"
+        impression = (
+            f"I took the scene as: {text[:220]}"
+            if en
+            else f"我对这场戏的感受是：{text[:220]}"
+        )
+        _store_one_string(
+            store,
+            name,
+            impression,
+            path,
+            retriever,
+            stimulus_text=text,
+            persona_brief=persona_briefs.get(name, ""),
+            model=model,
+            tokenizer=tokenizer,
+        )
 
 
 def extract_and_store(
@@ -758,12 +1357,14 @@ def extract_and_store(
     character: str = "",
     *,
     skip_gate: bool = False,
+    character_only: bool = False,
+    persona_brief: str = "",
 ) -> dict[str, list[str]]:
     """
-    Gate once → rewrite Narrator / Player / interlocutor → store each list.
-    Set skip_gate=True in story mode so dialogue beats are not dropped.
+    Gate once → rewrite perspectives → store with certainty scores.
+    Story NPC turns use character_only=True so only that character's biased
+    impressions are written (scene messages stay out of LTM).
     """
-    _ = recalled_hits  # available for future scoring; unused without certainty
     character = (character or "").strip()
     if not character:
         raise ValueError("character required for memory extract")
@@ -791,7 +1392,9 @@ def extract_and_store(
         PLAYER_KEY: [],
         character: [],
     }
-    for perspective in turn_memory_keys(character):
+    perspectives = [character] if character_only else turn_memory_keys(character)
+    blob = user_text if not assistant_text else f"{user_text}\n{assistant_text}"
+    for perspective in perspectives:
         fact_texts = summarize_for_perspective(
             model,
             tokenizer,
@@ -814,6 +1417,11 @@ def extract_and_store(
                 path,
                 retriever,
                 skip_norms=this_turn_norms,
+                stimulus_text=blob,
+                persona_brief=persona_brief if perspective == character else "",
+                recalled_hits=recalled_hits,
+                model=model,
+                tokenizer=tokenizer,
             )
             if saved is not None:
                 results[perspective].append(saved)
@@ -863,11 +1471,20 @@ def organize_memory(
     path: Path = MEMORY_PATH,
 ) -> dict:
     """
-    After good night: within each key that has session-new strings,
-    drop same/contradict peers (keep the earlier list entry).
+    After each scene (and good night): compare session_new facts to peers.
+    same / contradict → keep the higher-certainty entry (Rizz rule).
     """
-    session_map = _session_new_map(store)
-    keys = [k for k, texts in session_map.items() if texts]
+    # Prefer fact-level session_new flags; fall back to SESSION_NEW_KEY text map.
+    keys: list[str] = []
+    for key, values in store.items():
+        if not isinstance(key, str) or key.startswith("_") or not isinstance(values, list):
+            continue
+        ensure_character(store, key)
+        if any(bool(e.get("session_new")) for e in store[key]):
+            keys.append(key)
+    if not keys:
+        session_map = _session_new_map(store)
+        keys = [k for k, texts in session_map.items() if texts]
     if not keys:
         print("[organize] no new memories this session")
         return store
@@ -876,23 +1493,30 @@ def organize_memory(
         retriever.rebuild(store)
 
     for key in keys:
-        new_texts = list(session_map.get(key) or [])
-        if not new_texts:
-            continue
-        print(f"[organize] {key}: reviewing {len(new_texts)} new memor(ies)…")
         bucket = ensure_character(store, key)
-        drop_indices: set[int] = set()
-
-        for new_text in new_texts:
-            new_n = _normalize(new_text)
+        new_idxs = [i for i, e in enumerate(bucket) if e.get("session_new")]
+        if not new_idxs:
+            # Legacy text map path
+            session_map = _session_new_map(store)
+            wanted = {_normalize(t) for t in (session_map.get(key) or [])}
             new_idxs = [
                 i
-                for i, t in enumerate(bucket)
-                if _normalize(t) == new_n and i not in drop_indices
+                for i, e in enumerate(bucket)
+                if _normalize(_entry_text(e)) in wanted
             ]
-            if not new_idxs:
+        if not new_idxs:
+            continue
+        print(f"[organize] {key}: reviewing {len(new_idxs)} new memor(ies)…")
+        drop_indices: set[int] = set()
+
+        for new_i in list(new_idxs):
+            if new_i in drop_indices or new_i >= len(bucket):
                 continue
-            new_i = new_idxs[0]
+            new_entry = bucket[new_i]
+            new_text = _entry_text(new_entry)
+            if not new_text:
+                drop_indices.add(new_i)
+                continue
 
             candidates: list[int] = []
             if retriever is not None:
@@ -919,23 +1543,42 @@ def organize_memory(
             for other_i in candidates:
                 if new_i in drop_indices or other_i in drop_indices:
                     continue
-                other_text = bucket[other_i]
+                other_entry = bucket[other_i]
+                other_text = _entry_text(other_entry)
                 rel = classify_relation(model, tokenizer, new_text, other_text)
                 if rel == "unrelated":
                     continue
-                # Keep earlier list entry (lower index).
-                keep_i, discard_i = (new_i, other_i) if new_i < other_i else (other_i, new_i)
+                c_new = _entry_certainty(new_entry)
+                c_old = _entry_certainty(other_entry)
+                if c_new > c_old or (
+                    abs(c_new - c_old) < 1e-9 and new_entry.get("session_new")
+                ):
+                    keep_i, discard_i = new_i, other_i
+                else:
+                    keep_i, discard_i = other_i, new_i
                 print(
-                    f"[organize] {key} {rel}: keep «{bucket[keep_i]}» "
-                    f"drop «{bucket[discard_i]}»"
+                    f"[organize] {key} {rel}: keep «{_entry_text(bucket[keep_i])}» "
+                    f"(c={_entry_certainty(bucket[keep_i]):.2f}) "
+                    f"drop «{_entry_text(bucket[discard_i])}» "
+                    f"(c={_entry_certainty(bucket[discard_i]):.2f})"
                 )
                 drop_indices.add(discard_i)
+                if keep_i == other_i and rel in {"same", "contradict"}:
+                    bump_certainty(bucket[keep_i], amount=0.05)
 
         if drop_indices:
-            store[key] = [t for i, t in enumerate(bucket) if i not in drop_indices]
+            store[key] = [e for i, e in enumerate(bucket) if i not in drop_indices]
             print(f"[organize] {key}: removed {len(drop_indices)} memor(ies)")
 
+    # Clear session flags on survivors.
+    for key, values in store.items():
+        if not isinstance(key, str) or key.startswith("_") or not isinstance(values, list):
+            continue
+        for entry in ensure_character(store, key):
+            entry["session_new"] = False
     store[SESSION_NEW_KEY] = {}
     save_memory(store, path)
+    if retriever is not None:
+        retriever.rebuild(store)
     print(f"[organize] done. {count_memories(store)} memor(ies) remain.")
     return store
